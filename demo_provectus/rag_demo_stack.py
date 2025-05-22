@@ -12,6 +12,7 @@ from aws_cdk import (
     aws_secretsmanager as sm,
     aws_sns as sns,
     Environment,
+    aws_dynamodb as dynamodb,
 )
 from constructs import Construct
 
@@ -199,31 +200,96 @@ class RagDemoStack(Stack):
             code=_lambda.Code.from_asset("lambdas/load"),
             role=fn_role,
             timeout=Duration.seconds(60),
-            memory_size=512,
-            vpc=vpc,
-            security_groups=[cluster.connections.security_groups[0]],
+            memory_size=256,
             environment={
-                "DB_SECRET_NAME": db_secret.secret_name,
-                "CLUSTER_ARN": cluster.cluster_identifier,
+                "DB_SECRET_ARN": secret.secret_arn,
+                "DB_CLUSTER_ARN": cluster.cluster_identifier,
+                "DB_NAME": "ragdemo",
             },
         )
-        secret.grant_read(load_fn)  # Grant read access using the actual Secret
+        secret.grant_read(load_fn)
+        # Grant RDS Data API permissions
         load_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement"],
-                resources=["*"],  # Using wildcard since we need to access the cluster through the Data API
+                actions=[
+                    "rds-data:ExecuteStatement",
+                    "rds-data:BatchExecuteStatement",
+                    "rds-data:BeginTransaction",
+                    "rds-data:CommitTransaction",
+                    "rds-data:RollbackTransaction"
+                ],
+                resources=[f"arn:aws:rds:{self.region}:{self.account}:cluster:{cluster.cluster_identifier}"]
             )
         )
 
+        # 8. ExecLog DynamoDB Table
+        exec_log_table = dynamodb.Table(
+            self,
+            "ExecLogTable",
+            table_name="ExecLog",
+            partition_key=dynamodb.Attribute(
+                name="runId",
+                type=dynamodb.AttributeType.STRING
+            ),
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=data_key,
+            removal_policy=RemovalPolicy.DESTROY,  # DEV ONLY
+            time_to_live_attribute="ttl",
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+        )
+
+        # 9. Log Lambda
+        log_fn = _lambda.Function(
+            self,
+            "LogFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/log"),
+            role=fn_role,
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment={
+                "TABLE_NAME": exec_log_table.table_name,
+            },
+        )
+        exec_log_table.grant_write_data(log_fn)
+
         # ──────────────────────────
-        # 8. Step Functions definition
+        # 10. SNS Topic for Failures
         # ──────────────────────────
-        # Only stub states here (Textract wiring skipped for brevity)
+        failure_topic = sns.Topic(
+            self,
+            "FailureTopic",
+            topic_name="rag-demo-failures",
+            display_name="RAG Demo Pipeline Failures",
+            master_key=data_key,
+        )
+
+        # ──────────────────────────
+        # 11. Step Functions definition
+        # ──────────────────────────
+        # Add error handling and notifications to each task
         validate_task = tasks.LambdaInvoke(
             self,
             "Validate",
             lambda_function=validate_fn,
             result_path="$.validated",
+        ).add_catch(
+            errors=["States.ALL"],
+            handler=tasks.SnsPublish(
+                self, "ValidateFailureNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "error": sfn.JsonPath.string_at("$.Cause"),
+                    "state": "Validate",
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "s3Key": sfn.JsonPath.string_at("$.s3Key"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Validation Failed",
+                result_path="$.notified"
+            ),
+            result_path="$.error"
         )
 
         embed_task = tasks.LambdaInvoke(
@@ -231,6 +297,22 @@ class RagDemoStack(Stack):
             "Embed",
             lambda_function=embed_fn,
             result_path="$.embedded",
+        ).add_catch(
+            errors=["States.ALL"],
+            handler=tasks.SnsPublish(
+                self, "EmbedFailureNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "error": sfn.JsonPath.string_at("$.Cause"),
+                    "state": "Embed",
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "s3Key": sfn.JsonPath.string_at("$.s3Key"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Embedding Failed",
+                result_path="$.notified"
+            ),
+            result_path="$.error"
         )
         validate_task.next(embed_task)
 
@@ -239,8 +321,57 @@ class RagDemoStack(Stack):
             "LoadVectors",
             lambda_function=load_fn,
             result_path="$.loaded",
+        ).add_catch(
+            errors=["States.ALL"],
+            handler=tasks.SnsPublish(
+                self, "LoadFailureNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "error": sfn.JsonPath.string_at("$.Cause"),
+                    "state": "LoadVectors",
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "s3Key": sfn.JsonPath.string_at("$.s3Key"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Loading Failed",
+                result_path="$.notified"
+            ),
+            result_path="$.error"
         )
         embed_task.next(load_task)
+
+        # Add logging task with error handling
+        log_task = tasks.LambdaInvoke(
+            self,
+            "LogExecution",
+            lambda_function=log_fn,
+            result_path="$.logged",
+            payload=sfn.TaskInput.from_object({
+                "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                "s3Key": sfn.JsonPath.string_at("$.s3Key"),
+                "status": "SUCCEEDED",
+                "startTs": sfn.JsonPath.string_at("$$.Execution.StartTime"),
+                "endTs": sfn.JsonPath.string_at("$$.State.EnteredTime"),
+                "rowCount": sfn.JsonPath.number_at("$.loaded.Payload.rowCount")
+            })
+        ).add_catch(
+            errors=["States.ALL"],
+            handler=tasks.SnsPublish(
+                self, "LogFailureNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "error": sfn.JsonPath.string_at("$.Cause"),
+                    "state": "LogExecution",
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "s3Key": sfn.JsonPath.string_at("$.s3Key"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Logging Failed",
+                result_path="$.notified"
+            ),
+            result_path="$.error"
+        )
+        load_task.next(log_task)
 
         state_machine = sfn.StateMachine(
             self,
