@@ -2,3 +2,10 @@
 
 (Later you’ll add Textract, embed, load, log tasks in line.)
 
+add great expectations
+
+Having s3 KMS encryption issues, got rid of it and enable that later when the whole pipeline is tested
+s3 still encrypted static, not on transit
+
+
+Implement aurora postgres pgvector later - used dynamodb instead for demo.

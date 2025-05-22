@@ -1,35 +1,5 @@
 """
-AWS CDK Stack implementing a Retrieval-Augmented Generation (RAG) pipeline with the following components:
-
-Architecture Overview:
---------------------
-1. PDF Ingestion: S3 bucket with trigger for new PDF uploads
-2. Text Extraction: AWS Textract for PDF processing
-3. Validation: Custom validation of extracted text
-4. Embedding Generation: Using Amazon Bedrock for text embeddings
-5. Vector Storage: pgvector in Aurora PostgreSQL
-6. Execution Logging: DynamoDB for pipeline execution tracking
-7. Error Handling: SNS notifications for pipeline failures
-
-Security Features:
-----------------
-- KMS encryption for data at rest
-- VPC isolation for database
-- IAM roles with least privilege
-- S3 bucket policies
-- Private subnets for compute resources
-
-Flow:
-----
-1. User uploads PDF to S3 'incoming/' folder
-2. S3 event triggers Lambda
-3. Lambda starts Step Functions execution
-4. Step Functions orchestrates the pipeline:
-   - Textract PDF analysis
-   - Validation of extracted text
-   - Generate embeddings
-   - Store vectors in pgvector
-   - Log execution details
+AWS CDK Stack implementing a Retrieval-Augmented Generation (RAG) pipeline.
 """
 
 from aws_cdk import (
@@ -41,200 +11,237 @@ from aws_cdk import (
     aws_iam as iam,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
-    aws_rds as rds,
-    aws_ec2 as ec2,
-    aws_secretsmanager as sm,
-    aws_sns as sns,
-    Environment,
     aws_dynamodb as dynamodb,
     aws_s3_notifications as s3n,
 )
 from constructs import Construct
 
-
-class RagDemoStack(Stack):
-    """End‑to‑end demo stack: KMS + S3 → Textract → Validate → Embed → Load(pgvector)"""
-
+class StorageConstruct(Construct):
+    """Storage resources: S3 buckets and DynamoDB."""
+    
     def __init__(self, scope: Construct, id: str, **kwargs) -> None:
-        super().__init__(scope, id, **kwargs)
-
-        # ──────────────────────────
-        # 1. Encryption key
-        # ──────────────────────────
-        # Create KMS key for DynamoDB and SNS
-        data_key = kms.Key(
+        super().__init__(scope, id)
+        
+        # Create KMS key for DynamoDB
+        self.data_key = kms.Key(
             self, "DataKey",
             alias="alias/ragDemoKms",
             enable_key_rotation=True,
-            description="CMK for RAG demo data (DynamoDB and SNS)",
+            description="CMK for RAG demo data (DynamoDB)",
         )
 
-        # ──────────────────────────
-        # 2. S3 Buckets
-        # ──────────────────────────
-        # Raw PDF bucket - Stores incoming PDF documents
-        # - No encryption for demo purposes
-        # - No public access
-        # - Auto-cleanup for development
-        raw_bucket = s3.Bucket(
+        # Raw PDF bucket
+        self.raw_bucket = s3.Bucket(
             self, "RawPdfBucket",
             bucket_name="rag-demo-raw-pdf-v2",
-            encryption=s3.BucketEncryption.S3_MANAGED,  # Use S3 managed encryption instead of KMS
+            encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
         )
 
-        # Grant Textract read access to raw PDFs
-        raw_bucket.add_to_resource_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "s3:GetObject",
-                    "s3:GetObjectVersion",
-                    "s3:ListBucket",
-                    "s3:GetBucketLocation"
-                ],
-                principals=[iam.ServicePrincipal("textract.amazonaws.com")],
-                resources=[
-                    raw_bucket.bucket_arn,
-                    raw_bucket.arn_for_objects("*")
-                ]
-            )
-        )
-
-        # Textract output bucket - Stores JSON results from Textract
-        textract_bucket = s3.Bucket(
+        # Textract output bucket
+        self.textract_bucket = s3.Bucket(
             self, "TextractJsonBucket",
             bucket_name="rag-demo-textract-json-v2",
-            encryption=s3.BucketEncryption.S3_MANAGED,  # Use S3 managed encryption instead of KMS
+            encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
         )
 
-        # Grant Textract write access for results
-        textract_bucket.add_to_resource_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "s3:PutObject",
-                    "s3:PutObjectAcl",
-                    "s3:ListBucket",
-                    "s3:GetBucketLocation"
-                ],
-                principals=[iam.ServicePrincipal("textract.amazonaws.com")],
-                resources=[
-                    textract_bucket.bucket_arn,
-                    textract_bucket.arn_for_objects("*")
+        # DynamoDB table for documents and vectors
+        self.documents_table = dynamodb.Table(
+            self,
+            "DocumentsTable",
+            table_name="Documents",
+            partition_key=dynamodb.Attribute(
+                name="documentId",
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="chunkId",
+                type=dynamodb.AttributeType.STRING
+            ),
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=self.data_key,
+            removal_policy=RemovalPolicy.DESTROY,
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+        )
+
+        # DynamoDB table for execution logging
+        self.exec_log_table = dynamodb.Table(
+            self,
+            "ExecLogTable",
+            table_name="ExecLog",
+            partition_key=dynamodb.Attribute(
+                name="runId",
+                type=dynamodb.AttributeType.STRING
+            ),
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=self.data_key,
+            removal_policy=RemovalPolicy.DESTROY,
+            time_to_live_attribute="ttl",
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+        )
+
+class LambdaConstruct(Construct):
+    """Lambda functions and their roles."""
+    
+    def __init__(self, scope: Construct, id: str, storage: StorageConstruct, **kwargs) -> None:
+        super().__init__(scope, id)
+
+        # Create base Lambda role policies
+        lambda_base_policies = {
+            "CloudWatchLogs": iam.PolicyDocument(
+                statements=[
+                    iam.PolicyStatement(
+                        actions=["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+                        resources=["*"],
+                    )
                 ]
             )
+        }
+
+        # Initialize DB Function role and function
+        init_db_role = iam.Role(
+            self, "InitDbRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies=lambda_base_policies
+        )
+        storage.documents_table.grant_read_write_data(init_db_role)
+
+        self.init_db_fn = _lambda.Function(
+            self, "InitDbFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/init_db"),
+            role=init_db_role,
+            timeout=Duration.seconds(60),
+            memory_size=256,
+            environment={
+                "TABLE_NAME": storage.documents_table.table_name,
+            }
         )
 
-        # Add project tags to buckets
-        for b in (raw_bucket, textract_bucket):
-            Tags.of(b).add("project", "rag-demo")
-            Tags.of(b).add("env", "dev")
-
-        # ──────────────────────────
-        # 3. VPC & Aurora pgvector
-        # ──────────────────────────
-        # Create VPC with public and private subnets
-        # - 2 AZs for high availability
-        # - NAT Gateway for private subnet internet access
-        vpc = ec2.Vpc(
-            self, "RagDemoVpc",
-            max_azs=2,
-            nat_gateway_provider=ec2.NatProvider.instance(
-                instance_type=ec2.InstanceType("t3.micro"),
-                machine_image=ec2.AmazonLinuxImage(
-                    generation=ec2.AmazonLinuxGeneration.AMAZON_LINUX_2
-                )
-            ),
-            subnet_configuration=[
-                ec2.SubnetConfiguration(
-                    name="Public",
-                    subnet_type=ec2.SubnetType.PUBLIC,
-                    cidr_mask=24
-                ),
-                ec2.SubnetConfiguration(
-                    name="Private",
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                    cidr_mask=24
-                )
-            ]
+        # Validate Function role and function
+        validate_role = iam.Role(
+            self, "ValidateRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies=lambda_base_policies
         )
 
-        # Database credentials in Secrets Manager
-        db_secret = rds.Credentials.from_generated_secret(
-            secret_name="ragDemoDbSecret",
-            username="pgadmin",
+        self.validate_fn = _lambda.Function(
+            self, "ValidateFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/validate"),
+            role=validate_role,
+            timeout=Duration.seconds(60),
+            memory_size=256,
         )
 
-        # Aurora PostgreSQL cluster with pgvector extension
-        # - Serverless v2 for cost optimization
-        # - Placed in private subnets
-        cluster = rds.DatabaseCluster(
-            self,
-            "VectorCluster",
-            engine=rds.DatabaseClusterEngine.aurora_postgres(
-                version=rds.AuroraPostgresEngineVersion.VER_15_3
-            ),
-            writer=rds.ClusterInstance.serverless_v2(
-                "Writer",
-                auto_minor_version_upgrade=True,
-                instance_identifier="writer"
-            ),
-            vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
-            credentials=db_secret,
-            default_database_name="ragdemo",
-            removal_policy=RemovalPolicy.DESTROY,  # DEV ONLY
-        )
-
-        # ──────────────────────────
-        # 4. Shared Lambda Role
-        # ──────────────────────────
-        # IAM role used by all Lambda functions with permissions for:
-        # - CloudWatch Logs
-        # - VPC access
-        # - Step Functions
-        # - Textract
-        # - KMS
-        # - S3
-        fn_role = iam.Role(
-            self,
-            "DemoLambdaRole",
+        # Embed Function role and function
+        embed_role = iam.Role(
+            self, "EmbedRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             inline_policies={
-                "CloudWatchLogs": iam.PolicyDocument(
+                **lambda_base_policies,
+                "Bedrock": iam.PolicyDocument(
                     statements=[
                         iam.PolicyStatement(
-                            actions=["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-                            resources=["*"],
+                            actions=["bedrock:InvokeModel"],
+                            resources=["*"]
                         )
                     ]
-                ),
-                "VpcAccess": iam.PolicyDocument(
+                )
+            }
+        )
+
+        self.embed_fn = _lambda.Function(
+            self, "EmbedFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/embed"),
+            role=embed_role,
+            timeout=Duration.seconds(90),
+            memory_size=512,
+        )
+
+        # Load Function role and function
+        load_role = iam.Role(
+            self, "LoadRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies=lambda_base_policies
+        )
+        storage.documents_table.grant_read_write_data(load_role)
+
+        self.load_fn = _lambda.Function(
+            self, "LoadFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/load"),
+            role=load_role,
+            timeout=Duration.seconds(60),
+            memory_size=256,
+            environment={
+                "TABLE_NAME": storage.documents_table.table_name,
+            }
+        )
+
+        # Log Function role and function
+        log_role = iam.Role(
+            self, "LogRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies=lambda_base_policies
+        )
+        storage.exec_log_table.grant_write_data(log_role)
+
+        self.log_fn = _lambda.Function(
+            self, "LogFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/log"),
+            role=log_role,
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment={
+                "TABLE_NAME": storage.exec_log_table.table_name,
+            }
+        )
+
+        # Trigger Function role and function
+        trigger_role = iam.Role(
+            self, "TriggerRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies=lambda_base_policies
+        )
+
+        self.trigger_role = trigger_role  # Store for later use
+        self.trigger_fn = None  # Will be created after state machine
+
+class StateMachineConstruct(Construct):
+    """Step Functions state machine and related resources."""
+    
+    def __init__(self, scope: Construct, id: str, storage: StorageConstruct, lambda_fns: LambdaConstruct, **kwargs) -> None:
+        super().__init__(scope, id)
+
+        # State machine role
+        self.state_machine_role = iam.Role(
+            self,
+            "StateMachineRole",
+            assumed_by=iam.ServicePrincipal("states.amazonaws.com"),
+            inline_policies={
+                "LambdaInvoke": iam.PolicyDocument(
                     statements=[
                         iam.PolicyStatement(
-                            actions=[
-                                "ec2:CreateNetworkInterface",
-                                "ec2:DescribeNetworkInterfaces",
-                                "ec2:DeleteNetworkInterface",
-                                "ec2:AssignPrivateIpAddresses",
-                                "ec2:UnassignPrivateIpAddresses"
+                            actions=["lambda:InvokeFunction"],
+                            resources=[
+                                lambda_fns.init_db_fn.function_arn,
+                                lambda_fns.validate_fn.function_arn,
+                                lambda_fns.embed_fn.function_arn,
+                                lambda_fns.load_fn.function_arn,
                             ],
-                            resources=["*"],
-                        )
-                    ]
-                ),
-                "StepFunctions": iam.PolicyDocument(
-                    statements=[
-                        iam.PolicyStatement(
-                            actions=[
-                                "states:ListStateMachines",
-                                "states:StartExecution"
-                            ],
-                            resources=["*"],
                         )
                     ]
                 ),
@@ -251,275 +258,108 @@ class RagDemoStack(Stack):
                 )
             },
         )
-        data_key.grant_encrypt_decrypt(fn_role)
 
-        # ──────────────────────────
-        # 5. Lambda Functions
-        # ──────────────────────────
-        # Validate Function:
-        # - Validates Textract output
-        # - Checks for empty/invalid text blocks
-        validate_fn = _lambda.Function(
-            self,
-            "ValidateFn",
-            runtime=_lambda.Runtime.PYTHON_3_11,
-            handler="handler.handler",
-            code=_lambda.Code.from_asset("lambdas/validate"),
-            role=fn_role,
-            timeout=Duration.seconds(60),
-            memory_size=256,
-        )
+        # Grant S3 permissions
+        storage.raw_bucket.grant_read(self.state_machine_role)
+        storage.textract_bucket.grant_read_write(self.state_machine_role)
 
-        # Embed Function:
-        # - Generates embeddings using Amazon Bedrock
-        # - Processes validated text blocks
-        embed_fn = _lambda.Function(
-            self,
-            "EmbedFn",
-            runtime=_lambda.Runtime.PYTHON_3_11,
-            handler="handler.handler",
-            code=_lambda.Code.from_asset("lambdas/embed"),
-            role=fn_role,
-            timeout=Duration.seconds(90),
-            memory_size=512,
-            environment={},
-        )
-        embed_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["bedrock:InvokeModel"], resources=["*"]
+        # Step Functions workflow
+        workflow_definition = sfn.Chain.start(
+            tasks.LambdaInvoke(
+                self, "InitDb",
+                lambda_function=lambda_fns.init_db_fn,
+                retry_on_service_exceptions=True,
+                payload=sfn.TaskInput.from_object({})
             )
-        )
-
-        # Load Function:
-        # - Stores embeddings in pgvector
-        # - Uses RDS Data API
-        secret = sm.Secret.from_secret_name_v2(
-            self, "DbSecret",
-            secret_name=db_secret.secret_name
-        )
-
-        load_fn = _lambda.Function(
-            self,
-            "LoadFn",
-            runtime=_lambda.Runtime.PYTHON_3_11,
-            handler="handler.handler",
-            code=_lambda.Code.from_asset("lambdas/load"),
-            role=fn_role,
-            timeout=Duration.seconds(60),
-            memory_size=256,
-            environment={
-                "DB_SECRET_ARN": secret.secret_arn,
-                "DB_CLUSTER_ARN": cluster.cluster_identifier,
-                "DB_NAME": "ragdemo",
-            },
-        )
-        secret.grant_read(load_fn)
-        load_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "rds-data:ExecuteStatement",
-                    "rds-data:BatchExecuteStatement",
-                    "rds-data:BeginTransaction",
-                    "rds-data:CommitTransaction",
-                    "rds-data:RollbackTransaction"
-                ],
-                resources=[f"arn:aws:rds:{self.region}:{self.account}:cluster:{cluster.cluster_identifier}"]
-            )
-        )
-
-        # ──────────────────────────
-        # 8. Execution Logging
-        # ──────────────────────────
-        # DynamoDB table for pipeline execution tracking
-        exec_log_table = dynamodb.Table(
-            self,
-            "ExecLogTable",
-            table_name="ExecLog",
-            partition_key=dynamodb.Attribute(
-                name="runId",
-                type=dynamodb.AttributeType.STRING
-            ),
-            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
-            encryption_key=data_key,
-            removal_policy=RemovalPolicy.DESTROY,  # DEV ONLY
-            time_to_live_attribute="ttl",
-            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-        )
-
-        # Log Function:
-        # - Records pipeline execution details
-        log_fn = _lambda.Function(
-            self,
-            "LogFn",
-            runtime=_lambda.Runtime.PYTHON_3_11,
-            handler="handler.handler",
-            code=_lambda.Code.from_asset("lambdas/log"),
-            role=fn_role,
-            timeout=Duration.seconds(30),
-            memory_size=128,
-            environment={
-                "TABLE_NAME": exec_log_table.table_name,
-            },
-        )
-        exec_log_table.grant_write_data(log_fn)
-
-        # ──────────────────────────
-        # 10. Error Handling
-        # ──────────────────────────
-        # SNS topic for pipeline failure notifications
-        failure_topic = sns.Topic(
-            self,
-            "FailureTopic",
-            topic_name="rag-demo-failures",
-            display_name="RAG Demo Pipeline Failures",
-        )
-
-        # ──────────────────────────
-        # 11. Step Functions Workflow
-        # ──────────────────────────
-        # Textract task with error handling
-        textract_task = tasks.CallAwsService(
-            self,
-            "ExtractText",
-            service="textract",
-            action="startDocumentAnalysis",
-            parameters={
-                "DocumentLocation": {
-                    "S3Object": {
-                        "Bucket": sfn.JsonPath.string_at("$.bucket"),
-                        "Name": sfn.JsonPath.string_at("$.key")
+        ).next(
+            tasks.CallAwsService(
+                self, "ExtractText",
+                service="textract",
+                action="startDocumentAnalysis",
+                iam_resources=["*"],
+                parameters={
+                    "DocumentLocation": {
+                        "S3Object": {
+                            "Bucket": sfn.JsonPath.string_at("$.bucket"),
+                            "Name": sfn.JsonPath.string_at("$.key")
+                        }
+                    },
+                    "FeatureTypes": ["TABLES", "FORMS"],
+                    "OutputConfig": {
+                        "S3Bucket": storage.textract_bucket.bucket_name,
+                        "S3Prefix": "textract-output/"
                     }
                 },
-                "FeatureTypes": ["TABLES", "FORMS"],
-                "OutputConfig": {
-                    "S3Bucket": textract_bucket.bucket_name,
-                    "S3Prefix": "textract-output/"
-                }
-            },
-            iam_resources=["*"],
-            result_path="$.textract"
-        ).add_catch(
-            errors=["States.ALL"],
-            handler=tasks.SnsPublish(
-                self, "TextractFailureNotification",
-                topic=failure_topic,
-                message=sfn.TaskInput.from_object({
-                    "state": "ExtractText",
-                    "s3Key": sfn.JsonPath.string_at("$.key"),
-                    "cause": sfn.JsonPath.string_at("$.notified.Cause"),
-                    "error": sfn.JsonPath.string_at("$.notified.Error"),
-                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
-                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
-                }),
-                subject="RAG Demo Pipeline - Textract Failed"
-            ),
-            result_path="$.notified"
-        )
-
-        # Wait state to allow Textract job to complete
-        wait_state = sfn.Wait(
-            self, "WaitForTextract",
-            time=sfn.WaitTime.duration(Duration.seconds(60))
-        )
-
-        # Check Textract job status
-        check_job = tasks.CallAwsService(
-            self,
-            "CheckTextractJob",
-            service="textract",
-            action="getDocumentAnalysis",
-            parameters={
-                "JobId": sfn.JsonPath.string_at("$.textract.JobId")
-            },
-            iam_resources=["*"],
-            result_path="$.textract.status"
-        ).add_catch(
-            errors=["States.ALL"],
-            handler=tasks.SnsPublish(
-                self, "CheckJobFailureNotification",
-                topic=failure_topic,
-                message=sfn.TaskInput.from_object({
-                    "state": "CheckTextractJob",
-                    "jobId": sfn.JsonPath.string_at("$.textract.JobId"),
-                    "cause": sfn.JsonPath.string_at("$.error.Cause"),
-                    "error": sfn.JsonPath.string_at("$.error.Error"),
-                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
-                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
-                }),
-                subject="RAG Demo Pipeline - Job Check Failed"
-            ),
-            result_path="$.error"
-        )
-
-        # Validation task definition
-        validate_task = tasks.LambdaInvoke(
-            self,
-            "Validate",
-            lambda_function=validate_fn,
-            result_path="$.validated",
-            payload=sfn.TaskInput.from_object({
-                "textract": sfn.JsonPath.object_at("$.textract")
-            })
-        ).add_catch(
-            errors=["States.ALL"],
-            handler=tasks.SnsPublish(
-                self, "ValidateFailureNotification",
-                topic=failure_topic,
-                message=sfn.TaskInput.from_object({
-                    "state": "Validate",
-                    "jobId": sfn.JsonPath.string_at("$.textract.JobId"),
-                    "cause": sfn.JsonPath.string_at("$.error.Cause"),
-                    "error": sfn.JsonPath.string_at("$.error.Error"),
-                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
-                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
-                }),
-                subject="RAG Demo Pipeline - Validation Failed"
-            ),
-            result_path="$.error"
-        )
-
-        # Choice state to check if job is complete
-        job_complete = sfn.Choice(
-            self, "IsJobComplete"
-        ).when(
-            sfn.Condition.string_equals("$.textract.status.JobStatus", "SUCCEEDED"),
-            validate_task
-        ).when(
-            sfn.Condition.string_equals("$.textract.status.JobStatus", "IN_PROGRESS"),
-            wait_state
-        ).otherwise(
-            tasks.SnsPublish(
-                self, "JobFailedNotification",
-                topic=failure_topic,
-                message=sfn.TaskInput.from_object({
-                    "state": "IsJobComplete",
-                    "jobId": sfn.JsonPath.string_at("$.textract.JobId"),
-                    "status": sfn.JsonPath.string_at("$.textract.status.JobStatus"),
-                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
-                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
-                }),
-                subject="RAG Demo Pipeline - Job Failed"
+                result_path="$.textract"
+            )
+        ).next(
+            sfn.Wait(
+                self, "WaitForTextract",
+                time=sfn.WaitTime.duration(Duration.seconds(60))
+            )
+        ).next(
+            tasks.CallAwsService(
+                self, "CheckTextractJob",
+                service="textract",
+                action="getDocumentAnalysis",
+                iam_resources=["*"],
+                parameters={
+                    "JobId": sfn.JsonPath.string_at("$.textract.JobId")
+                },
+                result_path="$.textract.status"
+            )
+        ).next(
+            tasks.LambdaInvoke(
+                self, "Validate",
+                lambda_function=lambda_fns.validate_fn,
+                result_path="$.validated"
+            )
+        ).next(
+            tasks.LambdaInvoke(
+                self, "Embed",
+                lambda_function=lambda_fns.embed_fn,
+                result_path="$.embedded"
+            )
+        ).next(
+            tasks.LambdaInvoke(
+                self, "Load",
+                lambda_function=lambda_fns.load_fn,
+                result_path="$.loaded"
             )
         )
 
-        # State machine definition with wait and check loop
-        state_machine = sfn.StateMachine(
+        # Create state machine
+        self.state_machine = sfn.StateMachine(
             self, "EtlStateMachine",
-            definition=textract_task
-                .next(wait_state)
-                .next(check_job)
-                .next(job_complete)
+            definition=workflow_definition,
+            timeout=Duration.minutes(15),
+            role=self.state_machine_role,
         )
 
-        # Grant S3 permissions to Step Functions role
-        raw_bucket.grant_read(state_machine.role)
-        textract_bucket.grant_read_write(state_machine.role)
+class RagDemoStack(Stack):
+    """End‑to‑end demo stack: KMS + S3 → Textract → Validate → Embed → Load(DynamoDB)"""
 
-        # ──────────────────────────
-        # 12. S3 Event Trigger
-        # ──────────────────────────
-        # Lambda function to start Step Functions on S3 upload
-        trigger_fn = _lambda.Function(
+    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
+        super().__init__(scope, id, **kwargs)
+
+        # Create storage resources
+        storage = StorageConstruct(self, "Storage")
+
+        # Create Lambda functions
+        lambda_fns = LambdaConstruct(self, "Lambda", storage)
+
+        # Create state machine
+        state_machine = StateMachineConstruct(self, "StateMachine", storage, lambda_fns)
+
+        # Create trigger function after state machine
+        lambda_fns.trigger_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["states:StartExecution"],
+                resources=[state_machine.state_machine.state_machine_arn]
+            )
+        )
+
+        lambda_fns.trigger_fn = _lambda.Function(
             self,
             "TriggerFn",
             runtime=_lambda.Runtime.PYTHON_3_11,
@@ -528,44 +368,26 @@ class RagDemoStack(Stack):
 import boto3
 import json
 import logging
+import os
 
-# Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 sfn = boto3.client('stepfunctions')
+STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
 
 def handler(event, context):
     logger.info(f"Received event: {json.dumps(event)}")
     
     try:
-        # Get the S3 bucket and key from the event
         record = event['Records'][0]
         bucket = record['s3']['bucket']['name']
         key = record['s3']['object']['key']
         
         logger.info(f"Processing file: s3://{bucket}/{key}")
         
-        # Get state machine ARN
-        logger.info("Searching for EtlStateMachine")
-        paginator = sfn.get_paginator('list_state_machines')
-        state_machine_arn = None
-        for page in paginator.paginate():
-            for sm in page['stateMachines']:
-                logger.info(f"Found state machine: {sm['name']}")
-                if 'EtlStateMachine' in sm['name']:
-                    state_machine_arn = sm['stateMachineArn']
-                    logger.info(f"Found target state machine: {state_machine_arn}")
-                    break
-            if state_machine_arn:
-                break
-                
-        if not state_machine_arn:
-            raise ValueError("Could not find EtlStateMachine")
-        
-        # Start Step Functions execution
         execution = sfn.start_execution(
-            stateMachineArn=state_machine_arn,
+            stateMachineArn=STATE_MACHINE_ARN,
             input=json.dumps({
                 "bucket": bucket,
                 "key": key
@@ -581,25 +403,19 @@ def handler(event, context):
         logger.error(f"Error processing event: {str(e)}")
         raise
 """),
-            role=fn_role,
+            role=lambda_fns.trigger_role,
             timeout=Duration.seconds(30),
             memory_size=128,
+            environment={
+                "STATE_MACHINE_ARN": state_machine.state_machine.state_machine_arn
+            }
         )
 
-        # Grant Step Functions permissions to trigger function
-        trigger_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "states:ListStateMachines",
-                    "states:StartExecution"
-                ],
-                resources=["*"]
-            )
-        )
+        # Store resources for post-deployment configuration
+        self.raw_bucket = storage.raw_bucket
+        self.trigger_fn = lambda_fns.trigger_fn
 
-        # Configure S3 event notification
-        raw_bucket.add_event_notification(
-            s3.EventType.OBJECT_CREATED,
-            s3n.LambdaDestination(trigger_fn),
-            s3.NotificationKeyFilter(prefix="incoming/", suffix=".pdf")
-        )
+        # Add project tags
+        for resource in [storage.raw_bucket, storage.textract_bucket]:
+            Tags.of(resource).add("project", "rag-demo")
+            Tags.of(resource).add("env", "dev")
