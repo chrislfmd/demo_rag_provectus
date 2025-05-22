@@ -1,0 +1,7 @@
+{
+    "validated": {
+        "Payload": {
+            "text": "This is a test document for the RAG demo pipeline. It contains multiple sentences to test our chunking logic. The text will be split into chunks of approximately 500 tokens each. Each chunk will then be processed by the Bedrock Titan embedding model to generate vector embeddings. These embeddings will be stored in Aurora PostgreSQL using pgvector for later retrieval. The pipeline includes validation, embedding, and loading steps orchestrated by AWS Step Functions. This test document helps ensure our chunking and embedding logic works correctly with real-world text data."
+        }
+    }
+} 

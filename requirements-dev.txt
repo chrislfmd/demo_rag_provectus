@@ -1,1 +1,5 @@
 pytest==6.2.5
+boto3==1.34.47
+great_expectations==0.18.14   # only for validate_fn
+pgvector==0.2.4               # for load_fn → Aurora
+psycopg2-binary==2.9.9        # same

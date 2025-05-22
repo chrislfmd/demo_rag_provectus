@@ -1,0 +1,4 @@
+(Handlers for embed, load, log can stay stubbed for now; we can flesh them when you wire Step Functions.)
+
+(Later you’ll add Textract, embed, load, log tasks in line.)
+
