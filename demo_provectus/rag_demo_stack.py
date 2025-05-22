@@ -61,46 +61,25 @@ class RagDemoStack(Stack):
         # ──────────────────────────
         # 1. Encryption key
         # ──────────────────────────
-        # Create KMS key for encrypting all data at rest
-        # Used by: S3, DynamoDB, SNS, RDS
+        # Create KMS key for DynamoDB and SNS
         data_key = kms.Key(
             self, "DataKey",
             alias="alias/ragDemoKms",
             enable_key_rotation=True,
-            description="CMK for RAG demo data",
+            description="CMK for RAG demo data (DynamoDB and SNS)",
         )
-
-        # Grant Textract service permissions to use KMS key
-        # Required for: Reading encrypted S3 objects and writing results
-        data_key.add_to_resource_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "kms:Decrypt",
-                    "kms:GenerateDataKey",
-                    "kms:Encrypt",
-                    "kms:ReEncrypt*",
-                    "kms:DescribeKey"
-                ],
-                principals=[iam.ServicePrincipal("textract.amazonaws.com")],
-                resources=["*"]
-            )
-        )
-
-        # Additional explicit grant for Textract service
-        data_key.grant_encrypt_decrypt(iam.ServicePrincipal("textract.amazonaws.com"))
 
         # ──────────────────────────
         # 2. S3 Buckets
         # ──────────────────────────
         # Raw PDF bucket - Stores incoming PDF documents
-        # - KMS encryption
+        # - No encryption for demo purposes
         # - No public access
         # - Auto-cleanup for development
         raw_bucket = s3.Bucket(
             self, "RawPdfBucket",
             bucket_name="rag-demo-raw-pdf-v2",
-            encryption=s3.BucketEncryption.KMS,
-            encryption_key=data_key,
+            encryption=s3.BucketEncryption.S3_MANAGED,  # Use S3 managed encryption instead of KMS
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
@@ -109,9 +88,17 @@ class RagDemoStack(Stack):
         # Grant Textract read access to raw PDFs
         raw_bucket.add_to_resource_policy(
             iam.PolicyStatement(
-                actions=["s3:GetObject"],
+                actions=[
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation"
+                ],
                 principals=[iam.ServicePrincipal("textract.amazonaws.com")],
-                resources=[raw_bucket.arn_for_objects("*")]
+                resources=[
+                    raw_bucket.bucket_arn,
+                    raw_bucket.arn_for_objects("*")
+                ]
             )
         )
 
@@ -119,8 +106,7 @@ class RagDemoStack(Stack):
         textract_bucket = s3.Bucket(
             self, "TextractJsonBucket",
             bucket_name="rag-demo-textract-json-v2",
-            encryption=s3.BucketEncryption.KMS,
-            encryption_key=data_key,
+            encryption=s3.BucketEncryption.S3_MANAGED,  # Use S3 managed encryption instead of KMS
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
@@ -129,9 +115,17 @@ class RagDemoStack(Stack):
         # Grant Textract write access for results
         textract_bucket.add_to_resource_policy(
             iam.PolicyStatement(
-                actions=["s3:PutObject"],
+                actions=[
+                    "s3:PutObject",
+                    "s3:PutObjectAcl",
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation"
+                ],
                 principals=[iam.ServicePrincipal("textract.amazonaws.com")],
-                resources=[textract_bucket.arn_for_objects("*")]
+                resources=[
+                    textract_bucket.bucket_arn,
+                    textract_bucket.arn_for_objects("*")
+                ]
             )
         )
 
@@ -258,8 +252,6 @@ class RagDemoStack(Stack):
             },
         )
         data_key.grant_encrypt_decrypt(fn_role)
-        raw_bucket.grant_read(fn_role)
-        textract_bucket.grant_read_write(fn_role)
 
         # ──────────────────────────
         # 5. Lambda Functions
@@ -380,21 +372,93 @@ class RagDemoStack(Stack):
             "FailureTopic",
             topic_name="rag-demo-failures",
             display_name="RAG Demo Pipeline Failures",
-            master_key=data_key,
         )
 
         # ──────────────────────────
         # 11. Step Functions Workflow
         # ──────────────────────────
-        # Validation task with error handling
+        # Textract task with error handling
+        textract_task = tasks.CallAwsService(
+            self,
+            "ExtractText",
+            service="textract",
+            action="startDocumentAnalysis",
+            parameters={
+                "DocumentLocation": {
+                    "S3Object": {
+                        "Bucket": sfn.JsonPath.string_at("$.bucket"),
+                        "Name": sfn.JsonPath.string_at("$.key")
+                    }
+                },
+                "FeatureTypes": ["TABLES", "FORMS"],
+                "OutputConfig": {
+                    "S3Bucket": textract_bucket.bucket_name,
+                    "S3Prefix": "textract-output/"
+                }
+            },
+            iam_resources=["*"],
+            result_path="$.textract"
+        ).add_catch(
+            errors=["States.ALL"],
+            handler=tasks.SnsPublish(
+                self, "TextractFailureNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "state": "ExtractText",
+                    "s3Key": sfn.JsonPath.string_at("$.key"),
+                    "cause": sfn.JsonPath.string_at("$.notified.Cause"),
+                    "error": sfn.JsonPath.string_at("$.notified.Error"),
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Textract Failed"
+            ),
+            result_path="$.notified"
+        )
+
+        # Wait state to allow Textract job to complete
+        wait_state = sfn.Wait(
+            self, "WaitForTextract",
+            time=sfn.WaitTime.duration(Duration.seconds(60))
+        )
+
+        # Check Textract job status
+        check_job = tasks.CallAwsService(
+            self,
+            "CheckTextractJob",
+            service="textract",
+            action="getDocumentAnalysis",
+            parameters={
+                "JobId": sfn.JsonPath.string_at("$.textract.JobId")
+            },
+            iam_resources=["*"],
+            result_path="$.textract.status"
+        ).add_catch(
+            errors=["States.ALL"],
+            handler=tasks.SnsPublish(
+                self, "CheckJobFailureNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "state": "CheckTextractJob",
+                    "jobId": sfn.JsonPath.string_at("$.textract.JobId"),
+                    "cause": sfn.JsonPath.string_at("$.error.Cause"),
+                    "error": sfn.JsonPath.string_at("$.error.Error"),
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Job Check Failed"
+            ),
+            result_path="$.error"
+        )
+
+        # Validation task definition
         validate_task = tasks.LambdaInvoke(
             self,
             "Validate",
             lambda_function=validate_fn,
             result_path="$.validated",
             payload=sfn.TaskInput.from_object({
-                "bucket": textract_bucket.bucket_name,
-                "key": sfn.JsonPath.string_at("$.textract.DocumentLocation.S3Uri")
+                "textract": sfn.JsonPath.object_at("$.textract")
             })
         ).add_catch(
             errors=["States.ALL"],
@@ -403,7 +467,7 @@ class RagDemoStack(Stack):
                 topic=failure_topic,
                 message=sfn.TaskInput.from_object({
                     "state": "Validate",
-                    "s3Key": sfn.JsonPath.string_at("$.key"),
+                    "jobId": sfn.JsonPath.string_at("$.textract.JobId"),
                     "cause": sfn.JsonPath.string_at("$.error.Cause"),
                     "error": sfn.JsonPath.string_at("$.error.Error"),
                     "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
@@ -411,33 +475,45 @@ class RagDemoStack(Stack):
                 }),
                 subject="RAG Demo Pipeline - Validation Failed"
             ),
-            result_path="$.notified"
+            result_path="$.error"
         )
 
-        # State machine definition
+        # Choice state to check if job is complete
+        job_complete = sfn.Choice(
+            self, "IsJobComplete"
+        ).when(
+            sfn.Condition.string_equals("$.textract.status.JobStatus", "SUCCEEDED"),
+            validate_task
+        ).when(
+            sfn.Condition.string_equals("$.textract.status.JobStatus", "IN_PROGRESS"),
+            wait_state
+        ).otherwise(
+            tasks.SnsPublish(
+                self, "JobFailedNotification",
+                topic=failure_topic,
+                message=sfn.TaskInput.from_object({
+                    "state": "IsJobComplete",
+                    "jobId": sfn.JsonPath.string_at("$.textract.JobId"),
+                    "status": sfn.JsonPath.string_at("$.textract.status.JobStatus"),
+                    "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
+                    "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
+                }),
+                subject="RAG Demo Pipeline - Job Failed"
+            )
+        )
+
+        # State machine definition with wait and check loop
         state_machine = sfn.StateMachine(
             self, "EtlStateMachine",
-            definition=textract_task.add_catch(
-                errors=["States.ALL"],
-                handler=tasks.SnsPublish(
-                    self, "TextractFailureNotification",
-                    topic=failure_topic,
-                    message=sfn.TaskInput.from_object({
-                        "state": "ExtractText",
-                        "s3Key": sfn.JsonPath.string_at("$.key"),
-                        "cause": sfn.JsonPath.string_at("$.error.Cause"),
-                        "error": sfn.JsonPath.string_at("$.error.Error"),
-                        "runId": sfn.JsonPath.string_at("$$.Execution.Id"),
-                        "timestamp": sfn.JsonPath.string_at("$$.State.EnteredTime")
-                    }),
-                    subject="RAG Demo Pipeline - Textract Failed"
-                ),
-                result_path="$.notified"
-            ).next(validate_task)
+            definition=textract_task
+                .next(wait_state)
+                .next(check_job)
+                .next(job_complete)
         )
 
-        # Grant KMS permissions to Step Functions
-        data_key.grant_encrypt_decrypt(state_machine.role)
+        # Grant S3 permissions to Step Functions role
+        raw_bucket.grant_read(state_machine.role)
+        textract_bucket.grant_read_write(state_machine.role)
 
         # ──────────────────────────
         # 12. S3 Event Trigger
