@@ -22,28 +22,46 @@ def handler(event, context):
         if not document_id:
             raise ValueError("No documentId provided in event")
             
-        # Get embeddings from previous step
-        embeddings = event.get('embedded', {}).get('embeddings', [])
-        if not embeddings:
-            raise ValueError("No embeddings provided in event")
+        # Get embeddings and chunks from previous step
+        embedded_data = event.get('embedded', {})
+        if embedded_data.get('statusCode') != 200:
+            raise ValueError(f"Embedding failed: {embedded_data.get('error', 'Unknown error')}")
+            
+        chunks = embedded_data.get('chunks', [])
+        embeddings = embedded_data.get('embeddings', [])
+        
+        if not chunks or not embeddings:
+            raise ValueError("No chunks or embeddings provided in event")
+            
+        if len(chunks) != len(embeddings):
+            raise ValueError(f"Chunk count ({len(chunks)}) doesn't match embedding count ({len(embeddings)})")
             
         # Store each chunk with its embedding
-        for i, embedding in enumerate(embeddings):
+        items_stored = 0
+        for i, (chunk_text, embedding_vector) in enumerate(zip(chunks, embeddings)):
             chunk_id = f"chunk_{i}"
-            table.put_item(
-                Item={
-                    'documentId': document_id,
-                    'chunkId': chunk_id,
-                    'content': embedding.get('text', ''),
-                    'embedding': embedding.get('vector', []),
-                    'metadata': {
-                        'chunkIndex': i,
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                }
-            )
             
-        logger.info(f"Stored {len(embeddings)} chunks for document {document_id}")
+            try:
+                table.put_item(
+                    Item={
+                        'documentId': document_id,
+                        'chunkId': chunk_id,
+                        'content': chunk_text,
+                        'embedding': embedding_vector,
+                        'metadata': {
+                            'chunkIndex': i,
+                            'chunkLength': len(chunk_text),
+                            'embeddingDimension': len(embedding_vector) if embedding_vector else 0,
+                            'timestamp': datetime.utcnow().isoformat()
+                        }
+                    }
+                )
+                items_stored += 1
+            except Exception as chunk_error:
+                logger.error(f"Error storing chunk {i}: {str(chunk_error)}")
+                # Continue with other chunks but log the error
+                
+        logger.info(f"Stored {items_stored} chunks for document {document_id}")
         
         # Update document status
         table.update_item(
@@ -51,20 +69,22 @@ def handler(event, context):
                 'documentId': document_id,
                 'chunkId': 'metadata'
             },
-            UpdateExpression="SET #status = :status, lastUpdated = :timestamp",
+            UpdateExpression="SET #status = :status, lastUpdated = :timestamp, chunkCount = :count",
             ExpressionAttributeNames={
                 '#status': 'status'
             },
             ExpressionAttributeValues={
                 ':status': 'loaded',
-                ':timestamp': datetime.utcnow().isoformat()
+                ':timestamp': datetime.utcnow().isoformat(),
+                ':count': items_stored
             }
         )
         
         return {
             **event,
             'status': 'success',
-            'message': f'Successfully loaded {len(embeddings)} chunks'
+            'message': f'Successfully loaded {items_stored} chunks',
+            'rowCount': items_stored
         }
         
     except Exception as e:
