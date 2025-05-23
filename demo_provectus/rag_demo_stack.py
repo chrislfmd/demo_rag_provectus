@@ -263,6 +263,37 @@ class LambdaConstruct(Construct):
         self.trigger_role = trigger_role  # Store for later use
         self.trigger_fn = None  # Will be created after state machine
 
+        # Query Function role and function
+        query_role = iam.Role(
+            self, "QueryRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies={
+                **lambda_base_policies,
+                "Bedrock": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["bedrock:InvokeModel"],
+                            resources=["*"]
+                        )
+                    ]
+                )
+            }
+        )
+        storage.documents_table.grant_read_data(query_role)
+
+        self.query_fn = _lambda.Function(
+            self, "QueryFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/query"),
+            role=query_role,
+            timeout=Duration.seconds(120),
+            memory_size=512,
+            environment={
+                "TABLE_NAME": storage.documents_table.table_name,
+            }
+        )
+
 class StateMachineConstruct(Construct):
     """Step Functions state machine and related resources."""
     
