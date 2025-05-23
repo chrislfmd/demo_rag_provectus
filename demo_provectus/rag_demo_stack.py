@@ -50,6 +50,31 @@ class StorageConstruct(Construct):
             auto_delete_objects=True,
         )
 
+        # Add bucket policy to allow Textract service to write results
+        self.textract_bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal("textract.amazonaws.com")],
+                actions=[
+                    "s3:PutObject",
+                    "s3:PutObjectAcl"
+                ],
+                resources=[f"{self.textract_bucket.bucket_arn}/*"]
+            )
+        )
+        
+        self.textract_bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal("textract.amazonaws.com")],
+                actions=[
+                    "s3:GetBucketLocation",
+                    "s3:ListBucket"
+                ],
+                resources=[self.textract_bucket.bucket_arn]
+            )
+        )
+
         # DynamoDB table for documents and vectors
         self.documents_table = dynamodb.Table(
             self,
@@ -273,6 +298,35 @@ class StateMachineConstruct(Construct):
                             resources=["*"],
                         )
                     ]
+                ),
+                "S3Access": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=[
+                                "s3:GetObject",
+                                "s3:GetObjectVersion",
+                                "s3:GetBucketLocation",
+                                "s3:ListBucket"
+                            ],
+                            resources=[
+                                storage.raw_bucket.bucket_arn,
+                                f"{storage.raw_bucket.bucket_arn}/*"
+                            ],
+                        )
+                    ]
+                ),
+                "IAMPassRole": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["iam:PassRole"],
+                            resources=["*"],
+                            conditions={
+                                "StringEquals": {
+                                    "iam:PassedToService": "textract.amazonaws.com"
+                                }
+                            }
+                        )
+                    ]
                 )
             },
         )
@@ -302,11 +356,7 @@ class StateMachineConstruct(Construct):
                             "Name": sfn.JsonPath.string_at("$.key")
                         }
                     },
-                    "FeatureTypes": ["TABLES", "FORMS"],
-                    "OutputConfig": {
-                        "S3Bucket": storage.textract_bucket.bucket_name,
-                        "S3Prefix": "textract-output/"
-                    }
+                    "FeatureTypes": ["TABLES", "FORMS"]
                 },
                 result_path="$.textract"
             )
