@@ -128,7 +128,17 @@ class LambdaConstruct(Construct):
         validate_role = iam.Role(
             self, "ValidateRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-            inline_policies=lambda_base_policies
+            inline_policies={
+                **lambda_base_policies,
+                "Textract": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["textract:GetDocumentAnalysis"],
+                            resources=["*"]
+                        )
+                    ]
+                )
+            }
         )
 
         self.validate_fn = _lambda.Function(
@@ -137,7 +147,7 @@ class LambdaConstruct(Construct):
             handler="handler.handler",
             code=_lambda.Code.from_asset("lambdas/validate"),
             role=validate_role,
-            timeout=Duration.seconds(60),
+            timeout=Duration.seconds(900),
             memory_size=256,
         )
 
@@ -154,6 +164,14 @@ class LambdaConstruct(Construct):
                             resources=["*"]
                         )
                     ]
+                ),
+                "Textract": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["textract:GetDocumentAnalysis"],
+                            resources=["*"]
+                        )
+                    ]
                 )
             }
         )
@@ -164,7 +182,7 @@ class LambdaConstruct(Construct):
             handler="handler.handler",
             code=_lambda.Code.from_asset("lambdas/embed"),
             role=embed_role,
-            timeout=Duration.seconds(90),
+            timeout=Duration.seconds(300),
             memory_size=512,
         )
 
@@ -269,7 +287,7 @@ class StateMachineConstruct(Construct):
                 self, "InitDb",
                 lambda_function=lambda_fns.init_db_fn,
                 retry_on_service_exceptions=True,
-                payload=sfn.TaskInput.from_object({})
+                result_path="$.initDb"
             )
         ).next(
             tasks.CallAwsService(
@@ -295,36 +313,40 @@ class StateMachineConstruct(Construct):
         ).next(
             sfn.Wait(
                 self, "WaitForTextract",
-                time=sfn.WaitTime.duration(Duration.seconds(60))
-            )
-        ).next(
-            tasks.CallAwsService(
-                self, "CheckTextractJob",
-                service="textract",
-                action="getDocumentAnalysis",
-                iam_resources=["*"],
-                parameters={
-                    "JobId": sfn.JsonPath.string_at("$.textract.JobId")
-                },
-                result_path="$.textract.status"
+                time=sfn.WaitTime.duration(Duration.seconds(120))
             )
         ).next(
             tasks.LambdaInvoke(
                 self, "Validate",
                 lambda_function=lambda_fns.validate_fn,
+                payload=sfn.TaskInput.from_object({
+                    "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
+                    "bucket": sfn.JsonPath.string_at("$.bucket"),
+                    "key": sfn.JsonPath.string_at("$.key")
+                }),
                 result_path="$.validated"
-            )
-        ).next(
-            tasks.LambdaInvoke(
-                self, "Embed",
-                lambda_function=lambda_fns.embed_fn,
-                result_path="$.embedded"
-            )
-        ).next(
-            tasks.LambdaInvoke(
-                self, "Load",
-                lambda_function=lambda_fns.load_fn,
-                result_path="$.loaded"
+            ).next(
+                tasks.LambdaInvoke(
+                    self, "Embed",
+                    lambda_function=lambda_fns.embed_fn,
+                    payload=sfn.TaskInput.from_object({
+                        "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
+                        "bucket": sfn.JsonPath.string_at("$.bucket"),
+                        "key": sfn.JsonPath.string_at("$.key"),
+                        "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId")
+                    }),
+                    result_path="$.embedded"
+                )
+            ).next(
+                tasks.LambdaInvoke(
+                    self, "Load",
+                    lambda_function=lambda_fns.load_fn,
+                    payload=sfn.TaskInput.from_object({
+                        "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
+                        "embedded": sfn.JsonPath.object_at("$.embedded.Payload")
+                    }),
+                    result_path="$.loaded"
+                )
             )
         )
 
@@ -332,7 +354,7 @@ class StateMachineConstruct(Construct):
         self.state_machine = sfn.StateMachine(
             self, "EtlStateMachine",
             definition=workflow_definition,
-            timeout=Duration.minutes(15),
+            timeout=Duration.minutes(30),
             role=self.state_machine_role,
         )
 
