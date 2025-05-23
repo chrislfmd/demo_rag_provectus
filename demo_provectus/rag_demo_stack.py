@@ -269,6 +269,25 @@ class LambdaConstruct(Construct):
                             resources=["*"]
                         )
                     ]
+                ),
+                "SQS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sqs:SendMessage"],
+                            resources=[
+                                notifications.notification_queue.queue_arn,
+                                notifications.error_queue.queue_arn
+                            ]
+                        )
+                    ]
+                ),
+                "STS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sts:GetCallerIdentity"],
+                            resources=["*"]
+                        )
+                    ]
                 )
             }
         )
@@ -284,6 +303,8 @@ class LambdaConstruct(Construct):
             memory_size=512,
             environment={
                 "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+                "NOTIFICATION_QUEUE_URL": notifications.notification_queue.queue_url,
+                "ERROR_QUEUE_URL": notifications.error_queue.queue_url,
             }
         )
 
@@ -291,7 +312,28 @@ class LambdaConstruct(Construct):
         load_role = iam.Role(
             self, "LoadRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-            inline_policies=lambda_base_policies
+            inline_policies={
+                **lambda_base_policies,
+                "SQS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sqs:SendMessage"],
+                            resources=[
+                                notifications.notification_queue.queue_arn,
+                                notifications.success_queue.queue_arn
+                            ]
+                        )
+                    ]
+                ),
+                "STS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sts:GetCallerIdentity"],
+                            resources=["*"]
+                        )
+                    ]
+                )
+            }
         )
         storage.documents_table.grant_read_write_data(load_role)
         storage.exec_log_table.grant_write_data(load_role)
@@ -307,6 +349,8 @@ class LambdaConstruct(Construct):
             environment={
                 "TABLE_NAME": storage.documents_table.table_name,
                 "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+                "NOTIFICATION_QUEUE_URL": notifications.notification_queue.queue_url,
+                "SUCCESS_QUEUE_URL": notifications.success_queue.queue_url,
             }
         )
 

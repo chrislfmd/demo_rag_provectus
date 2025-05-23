@@ -6,6 +6,7 @@ import sys
 import uuid
 from typing import List, Dict, Any
 import tiktoken  # For token counting
+import os
 
 # Add path for common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,9 +29,75 @@ logger.setLevel(logging.INFO)
 # Initialize clients
 bedrock = boto3.client('bedrock-runtime')
 textract = boto3.client('textract')
+sqs = boto3.client('sqs')
 
 # Titan model ID for Bedrock
 MODEL_ID = "amazon.titan-embed-text-v2:0"
+
+def send_error_notification(run_id, bucket, key, document_id, error_message, processing_time, step="Embed"):
+    """Send error notification when embedding generation fails"""
+    try:
+        # Get SQS queue URLs from environment or use default names
+        notification_queue_url = os.environ.get('NOTIFICATION_QUEUE_URL')
+        error_queue_url = os.environ.get('ERROR_QUEUE_URL')
+        
+        if not notification_queue_url:
+            # Fallback: construct queue URL from account info
+            account_id = boto3.client('sts').get_caller_identity()['Account']
+            region = boto3.Session().region_name or 'us-east-1'
+            notification_queue_url = f"https://sqs.{region}.amazonaws.com/{account_id}/rag-pipeline-notifications"
+            error_queue_url = f"https://sqs.{region}.amazonaws.com/{account_id}/rag-pipeline-errors"
+        
+        error_notification = {
+            "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            "runId": run_id,
+            "status": "FAILED",
+            "pipeline": "RAG Document Processing",
+            "documentInfo": {
+                "bucket": bucket,
+                "key": key,
+                "documentId": document_id
+            },
+            "errorDetails": {
+                "failedStep": step,
+                "errorMessage": error_message,
+                "processingTimeSeconds": round(processing_time, 2),
+                "retryable": True
+            }
+        }
+        
+        # Send to main notification queue
+        try:
+            sqs.send_message(
+                QueueUrl=notification_queue_url,
+                MessageBody=json.dumps(error_notification, indent=2),
+                MessageAttributes={
+                    'Status': {'StringValue': 'FAILED', 'DataType': 'String'},
+                    'Pipeline': {'StringValue': 'RAG', 'DataType': 'String'},
+                    'FailedStep': {'StringValue': step, 'DataType': 'String'}
+                }
+            )
+            print(f"✅ Sent error notification to main queue")
+        except Exception as e:
+            print(f"⚠️ Failed to send to main queue: {str(e)}")
+        
+        # Send to error-specific queue
+        if error_queue_url:
+            try:
+                sqs.send_message(
+                    QueueUrl=error_queue_url,
+                    MessageBody=json.dumps(error_notification, indent=2),
+                    MessageAttributes={
+                        'Status': {'StringValue': 'FAILED', 'DataType': 'String'},
+                        'FailedStep': {'StringValue': step, 'DataType': 'String'}
+                    }
+                )
+                print(f"✅ Sent error notification to error queue")
+            except Exception as e:
+                print(f"⚠️ Failed to send to error queue: {str(e)}")
+        
+    except Exception as e:
+        print(f"❌ Failed to send error notification: {str(e)}")
 
 def count_tokens(text: str) -> int:
     """Count tokens using tiktoken's cl100k_base encoder."""
@@ -187,6 +254,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                              textractJobId=event.get("textractJobId"),
                              documentId=event.get("documentId"),
                              processingTime=processing_time)
+        
+        # Send error notification
+        send_error_notification(run_id, bucket, key, document_id, str(e), processing_time)
         
         return {
             'statusCode': 500,
