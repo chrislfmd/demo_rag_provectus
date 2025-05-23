@@ -135,6 +135,7 @@ class LambdaConstruct(Construct):
             inline_policies=lambda_base_policies
         )
         storage.documents_table.grant_read_write_data(init_db_role)
+        storage.exec_log_table.grant_write_data(init_db_role)
 
         self.init_db_fn = _lambda.Function(
             self, "InitDbFn",
@@ -146,6 +147,7 @@ class LambdaConstruct(Construct):
             memory_size=256,
             environment={
                 "TABLE_NAME": storage.documents_table.table_name,
+                "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
             }
         )
 
@@ -165,6 +167,7 @@ class LambdaConstruct(Construct):
                 )
             }
         )
+        storage.exec_log_table.grant_write_data(validate_role)
 
         self.validate_fn = _lambda.Function(
             self, "ValidateFn",
@@ -174,6 +177,9 @@ class LambdaConstruct(Construct):
             role=validate_role,
             timeout=Duration.seconds(900),
             memory_size=256,
+            environment={
+                "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+            }
         )
 
         # Embed Function role and function
@@ -200,6 +206,7 @@ class LambdaConstruct(Construct):
                 )
             }
         )
+        storage.exec_log_table.grant_write_data(embed_role)
 
         self.embed_fn = _lambda.Function(
             self, "EmbedFn",
@@ -209,6 +216,9 @@ class LambdaConstruct(Construct):
             role=embed_role,
             timeout=Duration.seconds(300),
             memory_size=512,
+            environment={
+                "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+            }
         )
 
         # Load Function role and function
@@ -218,6 +228,7 @@ class LambdaConstruct(Construct):
             inline_policies=lambda_base_policies
         )
         storage.documents_table.grant_read_write_data(load_role)
+        storage.exec_log_table.grant_write_data(load_role)
 
         self.load_fn = _lambda.Function(
             self, "LoadFn",
@@ -229,6 +240,7 @@ class LambdaConstruct(Construct):
             memory_size=256,
             environment={
                 "TABLE_NAME": storage.documents_table.table_name,
+                "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
             }
         )
 

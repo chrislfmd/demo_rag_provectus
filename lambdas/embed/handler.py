@@ -2,8 +2,24 @@ import json
 import boto3
 import time
 import logging
+import sys
+import uuid
 from typing import List, Dict, Any
 import tiktoken  # For token counting
+
+# Add path for common modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import execution logger
+try:
+    from common.exec_logger import logger as exec_logger
+except ImportError:
+    # Fallback if common module not available
+    class DummyLogger:
+        def log_start(self, *args, **kwargs): pass
+        def log_success(self, *args, **kwargs): pass
+        def log_error(self, *args, **kwargs): pass
+    exec_logger = DummyLogger()
 
 # Set up logging
 logger = logging.getLogger()
@@ -83,9 +99,17 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Lambda handler for text embedding."""
+    run_id = event.get('runId', str(uuid.uuid4()))
+    start_time = time.time()
+    
     logger.info(f"Received event: {json.dumps(event)}")
     
     try:
+        # Log step start
+        exec_logger.log_start(run_id, "embed",
+                             textractJobId=event.get("textractJobId"),
+                             documentId=event.get("documentId"))
+        
         # Get required parameters from event
         textract_job_id = event.get("textractJobId")
         bucket = event.get("bucket")
@@ -126,12 +150,25 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         embeddings = get_embeddings(chunks)
         logger.info(f"Generated {len(embeddings)} embeddings")
         
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        
+        # Log step success
+        exec_logger.log_success(run_id, "embed",
+                               textractJobId=textract_job_id,
+                               documentId=document_id,
+                               chunkCount=len(chunks),
+                               textLength=len(text),
+                               processingTime=processing_time,
+                               embeddingCount=len(embeddings))
+        
         return {
             'statusCode': 200,
             'textractJobId': textract_job_id,
             'documentId': document_id,
             'bucket': bucket,
             'key': key,
+            'runId': run_id,
             'chunks': chunks,
             'embeddings': embeddings,
             'text_length': len(text),
@@ -141,9 +178,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Handler error: {str(e)}")
         logger.error(f"Event structure: {json.dumps(event)}")
+        
+        # Calculate processing time for error logging
+        processing_time = time.time() - start_time
+        
+        # Log error
+        exec_logger.log_error(run_id, "embed", str(e),
+                             textractJobId=event.get("textractJobId"),
+                             documentId=event.get("documentId"),
+                             processingTime=processing_time)
+        
         return {
             'statusCode': 500,
             'error': str(e),
+            'runId': run_id,
             'chunks': [],
             'embeddings': []
         }

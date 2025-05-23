@@ -3,6 +3,22 @@ import boto3
 import os
 import logging
 import time
+import sys
+import uuid
+
+# Add path for common modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import execution logger
+try:
+    from common.exec_logger import logger as exec_logger
+except ImportError:
+    # Fallback if common module not available
+    class DummyLogger:
+        def log_start(self, *args, **kwargs): pass
+        def log_success(self, *args, **kwargs): pass
+        def log_error(self, *args, **kwargs): pass
+    exec_logger = DummyLogger()
 
 # Set up logging
 logger = logging.getLogger()
@@ -50,10 +66,17 @@ def wait_for_textract_completion(job_id, max_retries=10, wait_seconds=30):
     raise ValueError(f"Textract job did not complete after {max_retries} retries")
 
 def handler(event, _ctx):
+    run_id = event.get('runId', str(uuid.uuid4()))
+    
     # Log the input event
     logger.info(f"Received event: {json.dumps(event)}")
     
     try:
+        # Log step start
+        exec_logger.log_start(run_id, "validate",
+                             textractJobId=event.get("textractJobId"),
+                             s3Key=event.get("key"))
+        
         # Get required parameters from event
         textract_job_id = event.get("textractJobId")
         bucket = event.get("bucket") 
@@ -86,11 +109,18 @@ def handler(event, _ctx):
         
         logger.info("Validation successful")
         
+        # Log step success
+        exec_logger.log_success(run_id, "validate",
+                               textractJobId=textract_job_id,
+                               blocksCount=len(blocks),
+                               validationStatus="SUCCESS")
+        
         # Return the original event plus validation status
         return {
             "textractJobId": textract_job_id,
             "bucket": bucket,
             "key": key,
+            "runId": run_id,
             "validation": {
                 "status": "SUCCESS",
                 "blocks_count": len(blocks)
@@ -100,4 +130,10 @@ def handler(event, _ctx):
     except Exception as e:
         logger.error(f"Validation error: {str(e)}")
         logger.error(f"Event structure: {json.dumps(event)}")
+        
+        # Log error
+        exec_logger.log_error(run_id, "validate", str(e),
+                             textractJobId=event.get("textractJobId"),
+                             s3Key=event.get("key"))
+        
         raise

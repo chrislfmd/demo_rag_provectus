@@ -1,75 +1,91 @@
-import os
 import json
 import boto3
-import time
-from typing import Dict, Any
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta
+from decimal import Decimal
 
 # Initialize DynamoDB client
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table(os.environ['TABLE_NAME'])
 
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+def handler(event, context):
     """
-    Lambda handler for logging execution details to DynamoDB.
-    Expected event structure for success:
-    {
-        "runId": "uuid-string",
-        "s3Key": "path/to/file.pdf",
-        "status": "SUCCEEDED|FAILED",
-        "startTs": "2024-03-14T12:00:00Z",  # ISO format
-        "endTs": "2024-03-14T12:01:00Z",    # ISO format
-        "rowCount": 42                       # Number of embeddings stored
-    }
+    Log execution metadata to DynamoDB
     
-    For failures, the event will include:
+    Expected event structure:
     {
-        "error": {
-            "Cause": "error message",
-            "Error": "error type"
-        }
+        "runId": "unique-execution-id",
+        "status": "STARTED|IN_PROGRESS|SUCCESS|FAILED",
+        "step": "init_db|validate|embed|load",
+        "documentInfo": {...},
+        "metadata": {...},
+        "error": "error message if failed"
     }
     """
+    
     try:
-        # Add TTL (30 days from now)
-        ttl = int(time.time()) + (30 * 24 * 60 * 60)
+        # Extract required fields
+        run_id = event.get('runId')
+        status = event.get('status', 'UNKNOWN')
+        step = event.get('step', 'unknown')
         
-        # Check if this is an error case
-        if "error" in event:
-            item = {
-                "runId": event["runId"],
-                "s3Key": event["s3Key"],
-                "status": "FAILED",
-                "startTs": event["startTs"],
-                "endTs": datetime.now(timezone.utc).isoformat(),
-                "error": event["error"].get("Cause", "Unknown error"),
-                "failedState": event.get("state", "Unknown"),
-                "ttl": ttl
-            }
-        else:
-            item = {
-                "runId": event["runId"],
-                "s3Key": event["s3Key"],
-                "status": event["status"],
-                "startTs": event["startTs"],
-                "endTs": event["endTs"],
-                "rowCount": event.get("rowCount", 0),
-                "ttl": ttl
-            }
+        if not run_id:
+            raise ValueError("runId is required")
         
-        # Store execution log
-        table.put_item(Item=item)
+        # Create timestamp
+        timestamp = datetime.utcnow().isoformat()
+        
+        # TTL for 30 days (optional cleanup)
+        ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        
+        # Prepare log entry
+        log_entry = {
+            'runId': run_id,
+            'timestamp': timestamp,
+            'status': status,
+            'step': step,
+            'ttl': ttl
+        }
+        
+        # Add optional fields
+        if 'documentInfo' in event:
+            log_entry['documentInfo'] = event['documentInfo']
+            
+        if 'metadata' in event:
+            log_entry['metadata'] = event['metadata']
+            
+        if 'error' in event:
+            log_entry['error'] = event['error']
+            
+        if 'processingTime' in event:
+            log_entry['processingTime'] = Decimal(str(event['processingTime']))
+            
+        if 'chunkCount' in event:
+            log_entry['chunkCount'] = event['chunkCount']
+            
+        if 'textractJobId' in event:
+            log_entry['textractJobId'] = event['textractJobId']
+            
+        # Write to DynamoDB
+        table.put_item(Item=log_entry)
+        
+        print(f"✅ Logged execution: {run_id} - {step} - {status}")
         
         return {
-            "statusCode": 200,
-            "runId": event["runId"],
-            "message": "Execution log stored successfully",
-            "status": item["status"]
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Log entry created successfully',
+                'runId': run_id,
+                'step': step,
+                'status': status
+            })
         }
         
     except Exception as e:
-        print(f"Error storing execution log: {str(e)}")
+        print(f"❌ Error logging execution: {str(e)}")
         return {
-            "statusCode": 500,
-            "error": str(e)
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e)
+            })
         }
