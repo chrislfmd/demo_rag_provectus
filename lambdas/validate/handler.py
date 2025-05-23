@@ -27,6 +27,9 @@ logger.setLevel(logging.INFO)
 # Initialize Textract client
 textract = boto3.client('textract')
 
+# Initialize SQS client
+sqs = boto3.client('sqs')
+
 def validate_blocks(blocks):
     """Simple validation to check if blocks have non-empty text"""
     for block in blocks:
@@ -34,36 +37,99 @@ def validate_blocks(blocks):
             return False
     return True
 
-def wait_for_textract_completion(job_id, max_retries=10, wait_seconds=30):
-    """Wait for Textract job to complete with exponential backoff"""
-    retries = 0
-    
-    while retries < max_retries:
+def send_error_notification(run_id, bucket, key, error_message, step="Validate"):
+    """Send error notification directly to SQS"""
+    try:
+        # Get SQS queue URLs from environment or use default names
+        notification_queue_url = os.environ.get('NOTIFICATION_QUEUE_URL')
+        error_queue_url = os.environ.get('ERROR_QUEUE_URL')
+        
+        if not notification_queue_url:
+            # Fallback: construct queue URL from account info
+            account_id = boto3.client('sts').get_caller_identity()['Account']
+            region = boto3.Session().region_name or 'us-east-1'
+            notification_queue_url = f"https://sqs.{region}.amazonaws.com/{account_id}/rag-pipeline-notifications"
+            error_queue_url = f"https://sqs.{region}.amazonaws.com/{account_id}/rag-pipeline-errors"
+        
+        error_notification = {
+            "timestamp": time.strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            "runId": run_id,
+            "status": "FAILED",
+            "pipeline": "RAG Document Processing",
+            "documentInfo": {
+                "bucket": bucket,
+                "key": key
+            },
+            "errorDetails": {
+                "failedStep": step,
+                "errorMessage": error_message,
+                "retryable": False
+            }
+        }
+        
+        # Send to main notification queue
         try:
-            response = textract.get_document_analysis(JobId=job_id)
-            job_status = response.get("JobStatus")
+            sqs.send_message(
+                QueueUrl=notification_queue_url,
+                MessageBody=json.dumps(error_notification, indent=2),
+                MessageAttributes={
+                    'Status': {'StringValue': 'FAILED', 'DataType': 'String'},
+                    'Pipeline': {'StringValue': 'RAG', 'DataType': 'String'},
+                    'FailedStep': {'StringValue': step, 'DataType': 'String'}
+                }
+            )
+            print(f"✅ Sent error notification to main queue")
+        except Exception as e:
+            print(f"⚠️ Failed to send to main queue: {str(e)}")
+        
+        # Send to error-specific queue
+        if error_queue_url:
+            try:
+                sqs.send_message(
+                    QueueUrl=error_queue_url,
+                    MessageBody=json.dumps(error_notification, indent=2),
+                    MessageAttributes={
+                        'Status': {'StringValue': 'FAILED', 'DataType': 'String'},
+                        'FailedStep': {'StringValue': step, 'DataType': 'String'}
+                    }
+                )
+                print(f"✅ Sent error notification to error queue")
+            except Exception as e:
+                print(f"⚠️ Failed to send to error queue: {str(e)}")
+        
+    except Exception as e:
+        print(f"❌ Failed to send error notification: {str(e)}")
+
+def wait_for_textract_completion(textract_job_id, max_wait_time=300):
+    """Poll Textract job until completion with timeout"""
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_time:
+        try:
+            response = textract.get_document_analysis(JobId=textract_job_id)
+            status = response.get('JobStatus')
             
-            logger.info(f"Textract job {job_id} status: {job_status} (attempt {retries + 1})")
-            
-            if job_status == "SUCCEEDED":
+            if status == 'SUCCEEDED':
                 return response
-            elif job_status == "FAILED":
-                raise ValueError(f"Textract job failed: {response.get('StatusMessage', 'Unknown error')}")
-            elif job_status == "IN_PROGRESS":
-                # Wait with exponential backoff
-                wait_time = wait_seconds * (2 ** min(retries, 4))  # Cap at 16x base wait
-                logger.info(f"Job still in progress, waiting {wait_time} seconds...")
-                time.sleep(wait_time)
-                retries += 1
+            elif status == 'FAILED':
+                error_msg = response.get('StatusMessage', 'Unknown error')
+                raise ValueError(f"Textract job failed: {error_msg}")
+            elif status in ['IN_PROGRESS']:
+                print(f"Textract job {textract_job_id} still in progress, waiting...")
+                time.sleep(30)
             else:
-                raise ValueError(f"Unexpected Textract job status: {job_status}")
+                raise ValueError(f"Unexpected Textract status: {status}")
                 
         except Exception as e:
             if "InvalidJobIdException" in str(e):
-                raise ValueError(f"Invalid Textract job ID: {job_id}")
-            raise
+                raise ValueError(f"Textract job ID not found: {textract_job_id}")
+            elif "Textract job failed" in str(e):
+                raise  # Re-raise the specific error
+            else:
+                print(f"Error checking Textract status: {str(e)}")
+                time.sleep(10)
     
-    raise ValueError(f"Textract job did not complete after {max_retries} retries")
+    raise TimeoutError(f"Textract job {textract_job_id} did not complete within {max_wait_time} seconds")
 
 def handler(event, _ctx):
     run_id = event.get('runId', str(uuid.uuid4()))
@@ -130,6 +196,9 @@ def handler(event, _ctx):
     except Exception as e:
         logger.error(f"Validation error: {str(e)}")
         logger.error(f"Event structure: {json.dumps(event)}")
+        
+        # Send error notification directly
+        send_error_notification(run_id, bucket, key, str(e), "Validate")
         
         # Log error
         exec_logger.log_error(run_id, "validate", str(e),

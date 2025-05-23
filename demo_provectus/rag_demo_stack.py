@@ -13,8 +13,10 @@ from aws_cdk import (
     aws_stepfunctions_tasks as tasks,
     aws_dynamodb as dynamodb,
     aws_s3_notifications as s3n,
+    aws_sqs as sqs,
 )
 from constructs import Construct
+import uuid
 
 class StorageConstruct(Construct):
     """Storage resources: S3 buckets and DynamoDB."""
@@ -110,10 +112,55 @@ class StorageConstruct(Construct):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
         )
 
+class NotificationConstruct(Construct):
+    """SQS queues for pipeline notifications."""
+    
+    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
+        super().__init__(scope, id)
+        
+        # Dead letter queue for failed messages
+        self.dlq = sqs.Queue(
+            self, "NotificationDLQ",
+            queue_name="rag-pipeline-notifications-dlq",
+            retention_period=Duration.days(14),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        
+        # Main notification queue
+        self.notification_queue = sqs.Queue(
+            self, "NotificationQueue", 
+            queue_name="rag-pipeline-notifications",
+            visibility_timeout=Duration.minutes(5),
+            retention_period=Duration.days(7),
+            dead_letter_queue=sqs.DeadLetterQueue(
+                max_receive_count=3,
+                queue=self.dlq
+            ),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        
+        # Success-specific queue (optional, for filtered processing)
+        self.success_queue = sqs.Queue(
+            self, "SuccessQueue",
+            queue_name="rag-pipeline-success",
+            visibility_timeout=Duration.minutes(2),
+            retention_period=Duration.days(3),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        
+        # Error-specific queue (optional, for urgent error handling)
+        self.error_queue = sqs.Queue(
+            self, "ErrorQueue",
+            queue_name="rag-pipeline-errors",
+            visibility_timeout=Duration.minutes(2), 
+            retention_period=Duration.days(7),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
 class LambdaConstruct(Construct):
     """Lambda functions and their roles."""
     
-    def __init__(self, scope: Construct, id: str, storage: StorageConstruct, **kwargs) -> None:
+    def __init__(self, scope: Construct, id: str, storage: StorageConstruct, notifications: NotificationConstruct, **kwargs) -> None:
         super().__init__(scope, id)
 
         # Create base Lambda role policies
@@ -161,6 +208,25 @@ class LambdaConstruct(Construct):
                     statements=[
                         iam.PolicyStatement(
                             actions=["textract:GetDocumentAnalysis"],
+                            resources=["*"]
+                        )
+                    ]
+                ),
+                "SQS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sqs:SendMessage"],
+                            resources=[
+                                notifications.notification_queue.queue_arn,
+                                notifications.error_queue.queue_arn
+                            ]
+                        )
+                    ]
+                ),
+                "STS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sts:GetCallerIdentity"],
                             resources=["*"]
                         )
                     ]
@@ -265,6 +331,44 @@ class LambdaConstruct(Construct):
             }
         )
 
+        # Notification Function role and function
+        notify_role = iam.Role(
+            self, "NotifyRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies={
+                **lambda_base_policies,
+                "SQS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sqs:SendMessage"],
+                            resources=[
+                                notifications.notification_queue.queue_arn,
+                                notifications.success_queue.queue_arn,
+                                notifications.error_queue.queue_arn
+                            ]
+                        )
+                    ]
+                )
+            }
+        )
+        storage.exec_log_table.grant_write_data(notify_role)
+
+        self.notify_fn = _lambda.Function(
+            self, "NotifyFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_asset("lambdas/notify"),
+            role=notify_role,
+            timeout=Duration.seconds(60),
+            memory_size=256,
+            environment={
+                "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+                "NOTIFICATION_QUEUE_URL": notifications.notification_queue.queue_url,
+                "SUCCESS_QUEUE_URL": notifications.success_queue.queue_url,
+                "ERROR_QUEUE_URL": notifications.error_queue.queue_url,
+            }
+        )
+
         # Trigger Function role and function
         trigger_role = iam.Role(
             self, "TriggerRole",
@@ -327,6 +431,7 @@ class StateMachineConstruct(Construct):
                                 lambda_fns.validate_fn.function_arn,
                                 lambda_fns.embed_fn.function_arn,
                                 lambda_fns.load_fn.function_arn,
+                                lambda_fns.notify_fn.function_arn,
                             ],
                         )
                     ]
@@ -378,8 +483,9 @@ class StateMachineConstruct(Construct):
         storage.raw_bucket.grant_read(self.state_machine_role)
         storage.textract_bucket.grant_read_write(self.state_machine_role)
 
-        # Step Functions workflow
-        workflow_definition = sfn.Chain.start(
+        # Step Functions workflow with comprehensive error handling
+        # Define main processing steps without individual error handlers first
+        main_processing_steps = sfn.Chain.start(
             tasks.LambdaInvoke(
                 self, "InitDb",
                 lambda_function=lambda_fns.init_db_fn,
@@ -415,32 +521,85 @@ class StateMachineConstruct(Construct):
                 payload=sfn.TaskInput.from_object({
                     "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
                     "bucket": sfn.JsonPath.string_at("$.bucket"),
-                    "key": sfn.JsonPath.string_at("$.key")
+                    "key": sfn.JsonPath.string_at("$.key"),
+                    "runId": sfn.JsonPath.string_at("$.runId")
                 }),
                 result_path="$.validated"
-            ).next(
-                tasks.LambdaInvoke(
-                    self, "Embed",
-                    lambda_function=lambda_fns.embed_fn,
-                    payload=sfn.TaskInput.from_object({
-                        "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
+            )
+        ).next(
+            tasks.LambdaInvoke(
+                self, "Embed",
+                lambda_function=lambda_fns.embed_fn,
+                payload=sfn.TaskInput.from_object({
+                    "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
+                    "bucket": sfn.JsonPath.string_at("$.bucket"),
+                    "key": sfn.JsonPath.string_at("$.key"),
+                    "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
+                    "runId": sfn.JsonPath.string_at("$.runId")
+                }),
+                result_path="$.embedded"
+            )
+        ).next(
+            tasks.LambdaInvoke(
+                self, "Load",
+                lambda_function=lambda_fns.load_fn,
+                payload=sfn.TaskInput.from_object({
+                    "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
+                    "embedded": sfn.JsonPath.object_at("$.embedded.Payload"),
+                    "runId": sfn.JsonPath.string_at("$.runId")
+                }),
+                result_path="$.loaded"
+            )
+        ).next(
+            # Success notification
+            tasks.LambdaInvoke(
+                self, "NotifySuccess",
+                lambda_function=lambda_fns.notify_fn,
+                payload=sfn.TaskInput.from_object({
+                    "runId": sfn.JsonPath.string_at("$.runId"),
+                    "status": "SUCCESS",
+                    "documentInfo": {
                         "bucket": sfn.JsonPath.string_at("$.bucket"),
                         "key": sfn.JsonPath.string_at("$.key"),
                         "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId")
-                    }),
-                    result_path="$.embedded"
-                )
-            ).next(
-                tasks.LambdaInvoke(
-                    self, "Load",
-                    lambda_function=lambda_fns.load_fn,
-                    payload=sfn.TaskInput.from_object({
-                        "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
-                        "embedded": sfn.JsonPath.object_at("$.embedded.Payload")
-                    }),
-                    result_path="$.loaded"
-                )
+                    },
+                    "processingResults": {
+                        "chunkCount": sfn.JsonPath.number_at("$.embedded.Payload.chunk_count"),
+                        "textLength": sfn.JsonPath.number_at("$.embedded.Payload.text_length")
+                    }
+                }),
+                result_path="$.notification"
             )
+        )
+
+        # Comprehensive error notification handler
+        error_notification_step = tasks.LambdaInvoke(
+            self, "NotifyError",
+            lambda_function=lambda_fns.notify_fn,
+            payload=sfn.TaskInput.from_object({
+                "runId": sfn.JsonPath.string_at("$.runId"),
+                "status": "FAILED",
+                "documentInfo": {
+                    "bucket": sfn.JsonPath.string_at("$.bucket"),
+                    "key": sfn.JsonPath.string_at("$.key"),
+                    "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId")
+                },
+                "error": sfn.JsonPath.string_at("$.Error"),
+                "failedStep": sfn.JsonPath.string_at("$.Cause"),
+                "errorDetails": sfn.JsonPath.object_at("$.error")
+            })
+        )
+
+        # Use Parallel construct for robust error handling
+        workflow_definition = sfn.Parallel(
+            self, "MainWorkflowWithErrorHandling",
+            comment="RAG Pipeline with comprehensive error notifications"
+        ).branch(
+            main_processing_steps
+        ).add_catch(
+            error_notification_step,
+            errors=["States.ALL"],
+            result_path="$.error"
         )
 
         # Create state machine
@@ -460,8 +619,11 @@ class RagDemoStack(Stack):
         # Create storage resources
         storage = StorageConstruct(self, "Storage")
 
+        # Create notification resources
+        notifications = NotificationConstruct(self, "Notifications")
+
         # Create Lambda functions
-        lambda_fns = LambdaConstruct(self, "Lambda", storage)
+        lambda_fns = LambdaConstruct(self, "Lambda", storage, notifications)
 
         # Create state machine
         state_machine = StateMachineConstruct(self, "StateMachine", storage, lambda_fns)
@@ -484,6 +646,7 @@ import boto3
 import json
 import logging
 import os
+import uuid
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -499,20 +662,24 @@ def handler(event, context):
         bucket = record['s3']['bucket']['name']
         key = record['s3']['object']['key']
         
-        logger.info(f"Processing file: s3://{bucket}/{key}")
+        # Generate unique runId for tracking
+        run_id = str(uuid.uuid4())
+        
+        logger.info(f"Processing file: s3://{bucket}/{key} with runId: {run_id}")
         
         execution = sfn.start_execution(
             stateMachineArn=STATE_MACHINE_ARN,
             input=json.dumps({
                 "bucket": bucket,
-                "key": key
+                "key": key,
+                "runId": run_id
             })
         )
         logger.info(f"Started execution: {execution['executionArn']}")
         
         return {
             'statusCode': 200,
-            'body': f'Started execution {execution["executionArn"]} for s3://{bucket}/{key}'
+            'body': f'Started execution {execution["executionArn"]} for s3://{bucket}/{key} with runId: {run_id}'
         }
     except Exception as e:
         logger.error(f"Error processing event: {str(e)}")

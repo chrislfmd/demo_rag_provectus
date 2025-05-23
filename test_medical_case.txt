@@ -1,0 +1,29 @@
+Testing RAG Pipeline SQS Notifications
+
+This is a test document to verify our notification system works correctly.
+
+Patient Case Study:
+- Patient: Test Patient  
+- Age: 35
+- Chief Complaint: Testing the RAG pipeline with SQS notifications
+
+Medical History:
+The patient presents with symptoms that require documentation processing
+through our RAG pipeline system. This test will validate that:
+
+1. Textract can extract text from this PDF document
+2. Bedrock can generate embeddings from the extracted text  
+3. DynamoDB stores the document chunks and embeddings
+4. SQS notifications are sent upon SUCCESS
+
+Assessment:
+The pipeline should complete successfully and send notifications to:
+- Main notification queue (rag-pipeline-notifications)
+- Success-specific queue (rag-pipeline-success)
+
+Treatment Plan:
+If this works, we'll see notifications in our monitoring system!
+This validates the complete end-to-end notification functionality.
+
+Follow-up:
+Monitor SQS queues for success notifications with processing metrics. 
