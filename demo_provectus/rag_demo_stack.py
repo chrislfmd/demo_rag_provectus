@@ -14,6 +14,9 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_s3_notifications as s3n,
     aws_sqs as sqs,
+    aws_sns as sns,
+    aws_sns_subscriptions as sns_subscriptions,
+    aws_lambda_event_sources as event_sources,
 )
 from constructs import Construct
 import uuid
@@ -100,9 +103,13 @@ class StorageConstruct(Construct):
         self.exec_log_table = dynamodb.Table(
             self,
             "ExecLogTable",
-            table_name="ExecLog",
+            table_name="ExecLogV2",
             partition_key=dynamodb.Attribute(
                 name="runId",
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="stepTimestamp",
                 type=dynamodb.AttributeType.STRING
             ),
             encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
@@ -113,10 +120,33 @@ class StorageConstruct(Construct):
         )
 
 class NotificationConstruct(Construct):
-    """SQS queues for pipeline notifications."""
+    """SQS queues and SNS email notifications for pipeline notifications."""
     
-    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, id: str, email_address: str = "chris.lfmd@gmail.com", **kwargs) -> None:
         super().__init__(scope, id)
+        
+        # SNS Topic for email notifications
+        self.notification_topic = sns.Topic(
+            self, "NotificationTopic",
+            topic_name="rag-pipeline-notifications",
+            display_name="RAG Pipeline Notifications"
+        )
+        
+        # SNS Topic for critical error notifications
+        self.error_topic = sns.Topic(
+            self, "ErrorTopic", 
+            topic_name="rag-pipeline-errors",
+            display_name="RAG Pipeline Errors (Critical)"
+        )
+        
+        # Email subscriptions
+        self.notification_topic.add_subscription(
+            sns_subscriptions.EmailSubscription(email_address)
+        )
+        
+        self.error_topic.add_subscription(
+            sns_subscriptions.EmailSubscription(email_address)
+        )
         
         # Dead letter queue for failed messages
         self.dlq = sqs.Queue(
@@ -126,7 +156,7 @@ class NotificationConstruct(Construct):
             removal_policy=RemovalPolicy.DESTROY,
         )
         
-        # Main notification queue
+        # Main notification queue with SNS integration
         self.notification_queue = sqs.Queue(
             self, "NotificationQueue", 
             queue_name="rag-pipeline-notifications",
@@ -148,13 +178,169 @@ class NotificationConstruct(Construct):
             removal_policy=RemovalPolicy.DESTROY,
         )
         
-        # Error-specific queue (optional, for urgent error handling)
+        # Error-specific queue with SNS integration
         self.error_queue = sqs.Queue(
             self, "ErrorQueue",
             queue_name="rag-pipeline-errors",
             visibility_timeout=Duration.minutes(2), 
             retention_period=Duration.days(7),
             removal_policy=RemovalPolicy.DESTROY,
+        )
+        
+        # Create Lambda function to forward SQS messages to SNS
+        email_forwarder_role = iam.Role(
+            self, "EmailForwarderRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies={
+                "CloudWatchLogs": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+                            resources=["*"],
+                        )
+                    ]
+                ),
+                "SQS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+                            resources=[
+                                self.notification_queue.queue_arn,
+                                self.error_queue.queue_arn
+                            ]
+                        )
+                    ]
+                ),
+                "SNS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sns:Publish"],
+                            resources=[
+                                self.notification_topic.topic_arn,
+                                self.error_topic.topic_arn
+                            ]
+                        )
+                    ]
+                )
+            }
+        )
+        
+        # Email forwarder Lambda function
+        self.email_forwarder_fn = _lambda.Function(
+            self, "EmailForwarderFn",
+            runtime=_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            code=_lambda.Code.from_inline("""
+import json
+import boto3
+import logging
+import os
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+sns = boto3.client('sns')
+
+def handler(event, context):
+    logger.info(f"Processing {len(event.get('Records', []))} SQS messages")
+    
+    for record in event.get('Records', []):
+        try:
+            # Parse the SQS message
+            message_body = json.loads(record['body'])
+            
+            # Determine topic based on message content
+            status = message_body.get('status', 'UNKNOWN')
+            failed_step = message_body.get('errorDetails', {}).get('failedStep', 'Unknown')
+            
+            if status == 'FAILED':
+                topic_arn = os.environ['ERROR_TOPIC_ARN'] 
+                subject = f"🚨 RAG Pipeline Error - {failed_step} Failed"
+            else:
+                topic_arn = os.environ['NOTIFICATION_TOPIC_ARN']
+                subject = f"📡 RAG Pipeline Notification - {status}"
+            
+            # Create email-friendly message
+            email_body = f'''
+RAG Pipeline Notification
+
+Status: {status}
+Timestamp: {message_body.get('timestamp', 'Unknown')}
+Run ID: {message_body.get('runId', 'Unknown')}
+
+Document Information:
+- Bucket: {message_body.get('documentInfo', {}).get('bucket', 'Unknown')}
+- Key: {message_body.get('documentInfo', {}).get('key', 'Unknown')}
+
+'''
+            
+            if status == 'FAILED':
+                error_details = message_body.get('errorDetails', {})
+                email_body += f'''
+Error Details:
+- Failed Step: {error_details.get('failedStep', 'Unknown')}
+- Error Message: {error_details.get('errorMessage', 'Unknown')}
+- Processing Time: {error_details.get('processingTimeSeconds', 'Unknown')}s
+- Retryable: {error_details.get('retryable', 'Unknown')}
+'''
+            elif status == 'SUCCESS':
+                results = message_body.get('processingResults', {})
+                email_body += f'''
+Processing Results:
+- Chunks Created: {results.get('chunkCount', 'Unknown')}
+- Text Length: {results.get('textLength', 'Unknown')} characters
+- Processing Time: {results.get('processingTimeSeconds', 'Unknown')}s
+- Average Chunk Size: {results.get('avgChunkSize', 'Unknown')} characters
+'''
+            
+            email_body += f'''
+
+Raw Message:
+{json.dumps(message_body, indent=2)}
+'''
+            
+            # Send email via SNS
+            response = sns.publish(
+                TopicArn=topic_arn,
+                Subject=subject,
+                Message=email_body
+            )
+            
+            logger.info(f"Sent email notification: {response['MessageId']}")
+            
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
+            # Don't raise - let other messages process
+    
+    return {"statusCode": 200}
+"""),
+            role=email_forwarder_role,
+            timeout=Duration.seconds(60),
+            memory_size=256,
+            environment={
+                "NOTIFICATION_TOPIC_ARN": self.notification_topic.topic_arn,
+                "ERROR_TOPIC_ARN": self.error_topic.topic_arn,
+            }
+        )
+        
+        # Set up SQS triggers for the email forwarder
+        
+        # Trigger for notification queue
+        self.email_forwarder_fn.add_event_source(
+            event_sources.SqsEventSource(
+                self.notification_queue,
+                batch_size=10,
+                max_batching_window=Duration.seconds(30)
+            )
+        )
+        
+        # Trigger for error queue (immediate processing)
+        self.email_forwarder_fn.add_event_source(
+            event_sources.SqsEventSource(
+                self.error_queue,
+                batch_size=1,
+                max_batching_window=Duration.seconds(5)
+            )
         )
 
 class LambdaConstruct(Construct):
@@ -179,7 +365,28 @@ class LambdaConstruct(Construct):
         init_db_role = iam.Role(
             self, "InitDbRole",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-            inline_policies=lambda_base_policies
+            inline_policies={
+                **lambda_base_policies,
+                "SQS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sqs:SendMessage"],
+                            resources=[
+                                notifications.notification_queue.queue_arn,
+                                notifications.error_queue.queue_arn
+                            ]
+                        )
+                    ]
+                ),
+                "STS": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["sts:GetCallerIdentity"],
+                            resources=["*"]
+                        )
+                    ]
+                )
+            }
         )
         storage.documents_table.grant_read_write_data(init_db_role)
         storage.exec_log_table.grant_write_data(init_db_role)
@@ -195,6 +402,8 @@ class LambdaConstruct(Construct):
             environment={
                 "TABLE_NAME": storage.documents_table.table_name,
                 "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+                "NOTIFICATION_QUEUE_URL": notifications.notification_queue.queue_url,
+                "ERROR_QUEUE_URL": notifications.error_queue.queue_url,
             }
         )
 
@@ -245,6 +454,8 @@ class LambdaConstruct(Construct):
             memory_size=256,
             environment={
                 "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
+                "NOTIFICATION_QUEUE_URL": notifications.notification_queue.queue_url,
+                "ERROR_QUEUE_URL": notifications.error_queue.queue_url,
             }
         )
 
@@ -320,7 +531,8 @@ class LambdaConstruct(Construct):
                             actions=["sqs:SendMessage"],
                             resources=[
                                 notifications.notification_queue.queue_arn,
-                                notifications.success_queue.queue_arn
+                                notifications.success_queue.queue_arn,
+                                notifications.error_queue.queue_arn
                             ]
                         )
                     ]
@@ -351,6 +563,7 @@ class LambdaConstruct(Construct):
                 "EXEC_LOG_TABLE": storage.exec_log_table.table_name,
                 "NOTIFICATION_QUEUE_URL": notifications.notification_queue.queue_url,
                 "SUCCESS_QUEUE_URL": notifications.success_queue.queue_url,
+                "ERROR_QUEUE_URL": notifications.error_queue.queue_url,
             }
         )
 
@@ -533,39 +746,30 @@ class StateMachineConstruct(Construct):
             tasks.LambdaInvoke(
                 self, "InitDb",
                 lambda_function=lambda_fns.init_db_fn,
+                payload=sfn.TaskInput.from_object({
+                    "bucket": sfn.JsonPath.string_at("$.bucket"),
+                    "key": sfn.JsonPath.string_at("$.key"),
+                    "runId": sfn.JsonPath.string_at("$.runId")
+                }),
                 retry_on_service_exceptions=True,
                 result_path="$.initDb"
             )
         ).next(
-            tasks.CallAwsService(
-                self, "ExtractText",
-                service="textract",
-                action="startDocumentAnalysis",
-                iam_resources=["*"],
-                parameters={
-                    "DocumentLocation": {
-                        "S3Object": {
-                            "Bucket": sfn.JsonPath.string_at("$.bucket"),
-                            "Name": sfn.JsonPath.string_at("$.key")
-                        }
-                    },
-                    "FeatureTypes": ["TABLES", "FORMS"]
-                },
+            # Simulate Textract processing - no actual AWS service call for demo
+            sfn.Pass(
+                self, "SimulateTextract",
+                comment="Simulate Textract processing for demo purposes",
+                result=sfn.Result.from_object({"JobId": "simulated-textract-job"}),
                 result_path="$.textract"
-            )
-        ).next(
-            sfn.Wait(
-                self, "WaitForTextract",
-                time=sfn.WaitTime.duration(Duration.seconds(120))
             )
         ).next(
             tasks.LambdaInvoke(
                 self, "Validate",
                 lambda_function=lambda_fns.validate_fn,
                 payload=sfn.TaskInput.from_object({
-                    "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
                     "bucket": sfn.JsonPath.string_at("$.bucket"),
                     "key": sfn.JsonPath.string_at("$.key"),
+                    "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
                     "runId": sfn.JsonPath.string_at("$.runId")
                 }),
                 result_path="$.validated"
@@ -575,11 +779,12 @@ class StateMachineConstruct(Construct):
                 self, "Embed",
                 lambda_function=lambda_fns.embed_fn,
                 payload=sfn.TaskInput.from_object({
-                    "textractJobId": sfn.JsonPath.string_at("$.textract.JobId"),
+                    "textractJobId": sfn.JsonPath.string_at("$.validated.Payload.textractJobId"),
                     "bucket": sfn.JsonPath.string_at("$.bucket"),
                     "key": sfn.JsonPath.string_at("$.key"),
                     "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
-                    "runId": sfn.JsonPath.string_at("$.runId")
+                    "runId": sfn.JsonPath.string_at("$.runId"),
+                    "blocks": sfn.JsonPath.object_at("$.validated.Payload.blocks")
                 }),
                 result_path="$.embedded"
             )
@@ -588,6 +793,8 @@ class StateMachineConstruct(Construct):
                 self, "Load",
                 lambda_function=lambda_fns.load_fn,
                 payload=sfn.TaskInput.from_object({
+                    "bucket": sfn.JsonPath.string_at("$.bucket"),
+                    "key": sfn.JsonPath.string_at("$.key"),
                     "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
                     "embedded": sfn.JsonPath.object_at("$.embedded.Payload"),
                     "runId": sfn.JsonPath.string_at("$.runId")
@@ -616,7 +823,7 @@ class StateMachineConstruct(Construct):
             )
         )
 
-        # Comprehensive error notification handler
+        # Comprehensive error notification handler with proper error field handling
         error_notification_step = tasks.LambdaInvoke(
             self, "NotifyError",
             lambda_function=lambda_fns.notify_fn,
@@ -626,11 +833,14 @@ class StateMachineConstruct(Construct):
                 "documentInfo": {
                     "bucket": sfn.JsonPath.string_at("$.bucket"),
                     "key": sfn.JsonPath.string_at("$.key"),
-                    "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId")
+                    "documentId": "unknown"  # Use static value since initDb might have failed
                 },
-                "error": sfn.JsonPath.string_at("$.Error"),
-                "failedStep": sfn.JsonPath.string_at("$.Cause"),
-                "errorDetails": sfn.JsonPath.object_at("$.error")
+                "errorDetails": {
+                    "errorType": sfn.JsonPath.string_at("$.error.Error"),
+                    "errorMessage": sfn.JsonPath.string_at("$.error.Cause"),
+                    "failedStep": "Pipeline",
+                    "retryable": False
+                }
             })
         )
 
@@ -740,6 +950,12 @@ def handler(event, context):
         # Store resources for post-deployment configuration
         self.raw_bucket = storage.raw_bucket
         self.trigger_fn = lambda_fns.trigger_fn
+
+        # Configure S3 bucket notification to trigger the Lambda function
+        storage.raw_bucket.add_event_notification(
+            s3.EventType.OBJECT_CREATED,
+            s3n.LambdaDestination(lambda_fns.trigger_fn)
+        )
 
         # Add project tags
         for resource in [storage.raw_bucket, storage.textract_bucket]:

@@ -6,6 +6,7 @@ import uuid
 import sys
 import time
 from datetime import datetime
+from decimal import Decimal
 
 # Add path for common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +28,54 @@ logger.setLevel(logging.INFO)
 
 # Initialize SQS client
 sqs = boto3.client('sqs')
+
+def convert_floats_to_decimals(obj):
+    """Convert float values to Decimal for DynamoDB compatibility"""
+    if isinstance(obj, list):
+        return [convert_floats_to_decimals(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_floats_to_decimals(value) for key, value in obj.items()}
+    elif isinstance(obj, float):
+        return Decimal(str(obj))
+    else:
+        return obj
+
+def log_to_dynamodb(run_id, document_id, step, status, message=None):
+    """Log step execution to DynamoDB"""
+    table_name = os.environ.get("EXEC_LOG_TABLE")
+    if not table_name:
+        print("No EXEC_LOG_TABLE env var set, skipping log.")
+        return
+    
+    try:
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(table_name)
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        step_timestamp = f"{step}_{timestamp}"  # Unique sort key combining step and timestamp
+        
+        log_item = {
+            "runId": run_id or "unknown",
+            "stepTimestamp": step_timestamp,
+            "documentId": document_id or "unknown",
+            "step": step,
+            "status": status,
+            "timestamp": timestamp,
+            "message": message or ""
+        }
+        
+        print(f"Attempting to log to DynamoDB table '{table_name}': {log_item}")
+        
+        # Try the put_item operation
+        response = table.put_item(Item=log_item)
+        
+        print(f"DynamoDB put_item response: {response}")
+        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        
+    except Exception as e:
+        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"   Table name: {table_name}")
+        print(f"   Log item: {log_item}")
+        # Don't re-raise the exception to avoid breaking the Lambda
 
 def send_success_notification(run_id, bucket, key, document_id, chunks_stored, processing_time, total_text_length=0):
     """Send success notification when pipeline completes successfully"""
@@ -169,16 +218,16 @@ def send_error_notification(run_id, bucket, key, document_id, error_message, pro
 def handler(event, context):
     run_id = event.get('runId', str(uuid.uuid4()))
     start_time = time.time()
+    document_id = event.get('documentId')
+    step = "Load"
     
     # Extract document info for notifications
     bucket = event.get('bucket', 'unknown')
     key = event.get('key', 'unknown')
-    document_id = event.get('documentId')
     
     try:
         # Log step start
-        exec_logger.log_start(run_id, "load",
-                             documentId=document_id)
+        log_to_dynamodb(run_id, document_id, step, "STARTED", f"Loading chunks and embeddings for document {document_id}")
         
         # Get table name from environment
         table_name = os.environ['TABLE_NAME']
@@ -205,34 +254,39 @@ def handler(event, context):
             raise ValueError(f"Chunk count ({len(chunks)}) doesn't match embedding count ({len(embeddings)})")
             
         # Calculate total text length for metrics
-        total_text_length = sum(len(chunk) for chunk in chunks)
+        total_text_length = sum(chunk.get('length', len(chunk.get('text', ''))) for chunk in chunks)
             
         # Store each chunk with its embedding
         items_stored = 0
-        for i, (chunk_text, embedding_vector) in enumerate(zip(chunks, embeddings)):
-            chunk_id = f"chunk_{i}"
+        for i, (chunk, embedding_vector) in enumerate(zip(chunks, embeddings)):
+            chunk_id = chunk.get('chunkId', f"chunk_{i}")
+            chunk_text = chunk.get('text', '')
             
             try:
+                # Convert embedding vector to Decimal for DynamoDB compatibility
+                embedding_decimal = convert_floats_to_decimals(embedding_vector)
+                
                 table.put_item(
                     Item={
                         'documentId': document_id,
                         'chunkId': chunk_id,
                         'content': chunk_text,
-                        'embedding': embedding_vector,
-                        'metadata': {
+                        'embedding': embedding_decimal,
+                        'metadata': convert_floats_to_decimals({
                             'chunkIndex': i,
                             'chunkLength': len(chunk_text),
                             'embeddingDimension': len(embedding_vector) if embedding_vector else 0,
+                            'confidence': chunk.get('confidence', 95.0),
                             'timestamp': datetime.utcnow().isoformat()
-                        }
+                        })
                     }
                 )
                 items_stored += 1
             except Exception as chunk_error:
-                logger.error(f"Error storing chunk {i}: {str(chunk_error)}")
+                print(f"Error storing chunk {i}: {str(chunk_error)}")
                 # Continue with other chunks but log the error
                 
-        logger.info(f"Stored {items_stored} chunks for document {document_id}")
+        print(f"Stored {items_stored} chunks for document {document_id}")
         
         # Update document status
         table.update_item(
@@ -257,17 +311,9 @@ def handler(event, context):
         # Send success notification - PIPELINE COMPLETED! 🎉
         send_success_notification(run_id, bucket, key, document_id, items_stored, processing_time, total_text_length)
         
-        # Log document completion
-        exec_logger.log_document_complete(run_id, items_stored, processing_time,
-                                         documentId=document_id,
-                                         tableName=table_name)
-        
         # Log step success
-        exec_logger.log_success(run_id, "load",
-                               documentId=document_id,
-                               itemsStored=items_stored,
-                               processingTime=processing_time,
-                               tableName=table_name)
+        log_to_dynamodb(run_id, document_id, step, "SUCCESS", 
+                       f"Successfully loaded {items_stored} chunks to DynamoDB table {table_name}")
         
         return {
             **event,
@@ -277,17 +323,16 @@ def handler(event, context):
         }
         
     except Exception as e:
-        logger.error(f"Error loading document: {str(e)}")
+        error_message = str(e)
+        print(f"Error loading document: {error_message}")
         
         # Calculate processing time for error logging
         processing_time = time.time() - start_time
         
-        # Send error notification
-        send_error_notification(run_id, bucket, key, document_id, str(e), processing_time, "Load")
-        
         # Log error
-        exec_logger.log_error(run_id, "load", str(e),
-                             documentId=document_id,
-                             processingTime=processing_time)
+        log_to_dynamodb(run_id, document_id, step, "FAILED", f"Load failed: {error_message}")
+        
+        # Send error notification
+        send_error_notification(run_id, bucket, key, document_id, error_message, processing_time, step)
         
         raise

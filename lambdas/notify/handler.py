@@ -1,27 +1,46 @@
 import json
 import boto3
 import os
-import sys
 import uuid
 from datetime import datetime
 from typing import Dict, Any
 
-# Add path for common modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Import execution logger
-try:
-    from common.exec_logger import logger as exec_logger
-except ImportError:
-    # Fallback if common module not available
-    class DummyLogger:
-        def log_start(self, *args, **kwargs): pass
-        def log_success(self, *args, **kwargs): pass
-        def log_error(self, *args, **kwargs): pass
-    exec_logger = DummyLogger()
-
-# Initialize SQS client
-sqs = boto3.client('sqs')
+def log_to_dynamodb(run_id, document_id, step, status, message=None):
+    """Log step execution to DynamoDB"""
+    table_name = os.environ.get("EXEC_LOG_TABLE")
+    if not table_name:
+        print("No EXEC_LOG_TABLE env var set, skipping log.")
+        return
+    
+    try:
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(table_name)
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        step_timestamp = f"{step}_{timestamp}"  # Unique sort key combining step and timestamp
+        
+        log_item = {
+            "runId": run_id or "unknown",
+            "stepTimestamp": step_timestamp,
+            "documentId": document_id or "unknown",
+            "step": step,
+            "status": status,
+            "timestamp": timestamp,
+            "message": message or ""
+        }
+        
+        print(f"Attempting to log to DynamoDB table '{table_name}': {log_item}")
+        
+        # Try the put_item operation
+        response = table.put_item(Item=log_item)
+        
+        print(f"DynamoDB put_item response: {response}")
+        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        
+    except Exception as e:
+        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"   Table name: {table_name}")
+        print(f"   Log item: {log_item}")
+        # Don't re-raise the exception to avoid breaking the Lambda
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
@@ -46,12 +65,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     
     run_id = event.get('runId', str(uuid.uuid4()))
+    document_id = event.get('documentInfo', {}).get('documentId', 'unknown')
+    step = "Notify"
     
     try:
         # Log notification start
-        exec_logger.log_start(run_id, "notify", 
-                             status=event.get('status'),
-                             documentId=event.get('documentInfo', {}).get('documentId'))
+        log_to_dynamodb(run_id, document_id, step, "STARTED", f"Sending notifications for status: {event.get('status')}")
         
         # Get required parameters
         status = event.get('status', 'UNKNOWN')
@@ -66,6 +85,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not main_queue_url:
             raise ValueError("NOTIFICATION_QUEUE_URL environment variable not set")
         
+        # Initialize SQS client
+        sqs = boto3.client('sqs')
+        
         # Create notification message
         notification_message = {
             "timestamp": datetime.utcnow().isoformat(),
@@ -77,8 +99,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
         
         # Add error information if failed
-        if status == "FAILED" and 'error' in event:
-            notification_message['error'] = event['error']
+        if status == "FAILED" and 'errorDetails' in event:
+            notification_message['errorDetails'] = event['errorDetails']
         
         # Create message attributes
         message_attributes = {
@@ -145,9 +167,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 error_message = {
                     **notification_message,
                     "errorDetails": {
-                        "failedStep": event.get('failedStep', 'unknown'),
-                        "errorMessage": event.get('error', 'Unknown error'),
-                        "retryable": event.get('retryable', False)
+                        "failedStep": event.get('errorDetails', {}).get('failedStep', 'unknown'),
+                        "errorMessage": event.get('errorDetails', {}).get('errorMessage', 'Unknown error'),
+                        "retryable": event.get('errorDetails', {}).get('retryable', False)
                     }
                 }
                 
@@ -162,10 +184,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 print(f"⚠️ Failed to send to error queue: {str(e)}")
         
         # Log success
-        exec_logger.log_success(run_id, "notify",
-                               status=status,
-                               messagesSent=messages_sent,
-                               documentId=document_info.get('documentId'))
+        log_to_dynamodb(run_id, document_id, step, "SUCCESS", 
+                       f"Successfully sent {messages_sent} notifications for {status} status")
         
         return {
             'statusCode': 200,
@@ -178,17 +198,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        print(f"❌ Error sending notifications: {str(e)}")
+        error_message = str(e)
+        print(f"❌ Error sending notifications: {error_message}")
         
         # Log error
-        exec_logger.log_error(run_id, "notify", str(e),
-                             status=event.get('status'),
-                             documentId=event.get('documentInfo', {}).get('documentId'))
+        log_to_dynamodb(run_id, document_id, step, "FAILED", f"Notification failed: {error_message}")
         
         return {
             'statusCode': 500,
             'body': json.dumps({
-                'error': str(e),
+                'error': error_message,
                 'runId': run_id
             })
         } 

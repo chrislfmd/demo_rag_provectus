@@ -1,45 +1,52 @@
 import json
 import boto3
 import os
-import logging
 import time
-import sys
 import uuid
+from datetime import datetime
 
-# Add path for common modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def log_to_dynamodb(run_id, document_id, step, status, message=None):
+    """Log step execution to DynamoDB"""
+    table_name = os.environ.get("EXEC_LOG_TABLE")
+    if not table_name:
+        print("No EXEC_LOG_TABLE env var set, skipping log.")
+        return
+    
+    try:
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(table_name)
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        step_timestamp = f"{step}_{timestamp}"  # Unique sort key combining step and timestamp
+        
+        log_item = {
+            "runId": run_id or "unknown",
+            "stepTimestamp": step_timestamp,
+            "documentId": document_id or "unknown",
+            "step": step,
+            "status": status,
+            "timestamp": timestamp,
+            "message": message or ""
+        }
+        
+        print(f"Attempting to log to DynamoDB table '{table_name}': {log_item}")
+        
+        # Try the put_item operation
+        response = table.put_item(Item=log_item)
+        
+        print(f"DynamoDB put_item response: {response}")
+        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        
+    except Exception as e:
+        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"   Table name: {table_name}")
+        print(f"   Log item: {log_item}")
+        # Don't re-raise the exception to avoid breaking the Lambda
 
-# Import execution logger
-try:
-    from common.exec_logger import logger as exec_logger
-except ImportError:
-    # Fallback if common module not available
-    class DummyLogger:
-        def log_start(self, *args, **kwargs): pass
-        def log_success(self, *args, **kwargs): pass
-        def log_error(self, *args, **kwargs): pass
-    exec_logger = DummyLogger()
-
-# Set up logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-# Initialize Textract client
-textract = boto3.client('textract')
-
-# Initialize SQS client
-sqs = boto3.client('sqs')
-
-def validate_blocks(blocks):
-    """Simple validation to check if blocks have non-empty text"""
-    for block in blocks:
-        if "Text" in block and not block["Text"].strip():
-            return False
-    return True
-
-def send_error_notification(run_id, bucket, key, error_message, step="Validate"):
+def send_error_notification(run_id, bucket, key, document_id, error_message, processing_time, step="Validate"):
     """Send error notification directly to SQS"""
     try:
+        sqs = boto3.client('sqs')
+        
         # Get SQS queue URLs from environment or use default names
         notification_queue_url = os.environ.get('NOTIFICATION_QUEUE_URL')
         error_queue_url = os.environ.get('ERROR_QUEUE_URL')
@@ -58,11 +65,13 @@ def send_error_notification(run_id, bucket, key, error_message, step="Validate")
             "pipeline": "RAG Document Processing",
             "documentInfo": {
                 "bucket": bucket,
-                "key": key
+                "key": key,
+                "documentId": document_id
             },
             "errorDetails": {
                 "failedStep": step,
                 "errorMessage": error_message,
+                "processingTimeSeconds": round(processing_time, 2),
                 "retryable": False
             }
         }
@@ -100,109 +109,122 @@ def send_error_notification(run_id, bucket, key, error_message, step="Validate")
     except Exception as e:
         print(f"❌ Failed to send error notification: {str(e)}")
 
-def wait_for_textract_completion(textract_job_id, max_wait_time=300):
-    """Poll Textract job until completion with timeout"""
-    start_time = time.time()
+def simulate_textract_processing(bucket, key):
+    """Simulate Textract document analysis"""
+    print(f"Simulating Textract processing for s3://{bucket}/{key}")
     
-    while time.time() - start_time < max_wait_time:
-        try:
-            response = textract.get_document_analysis(JobId=textract_job_id)
-            status = response.get('JobStatus')
-            
-            if status == 'SUCCEEDED':
-                return response
-            elif status == 'FAILED':
-                error_msg = response.get('StatusMessage', 'Unknown error')
-                raise ValueError(f"Textract job failed: {error_msg}")
-            elif status in ['IN_PROGRESS']:
-                print(f"Textract job {textract_job_id} still in progress, waiting...")
-                time.sleep(30)
-            else:
-                raise ValueError(f"Unexpected Textract status: {status}")
-                
-        except Exception as e:
-            if "InvalidJobIdException" in str(e):
-                raise ValueError(f"Textract job ID not found: {textract_job_id}")
-            elif "Textract job failed" in str(e):
-                raise  # Re-raise the specific error
-            else:
-                print(f"Error checking Textract status: {str(e)}")
-                time.sleep(10)
+    # Simulate processing time
+    time.sleep(2)
     
-    raise TimeoutError(f"Textract job {textract_job_id} did not complete within {max_wait_time} seconds")
+    # Check file extension to simulate different outcomes
+    file_extension = key.lower().split('.')[-1] if '.' in key else ''
+    
+    if file_extension in ['txt', 'csv', 'json']:
+        # Simulate error for unsupported file types
+        raise ValueError(f"Textract job failed: INVALID_IMAGE_TYPE")
+    
+    # Simulate successful processing for supported file types
+    simulated_blocks = [
+        {
+            "BlockType": "LINE",
+            "Text": "This is simulated text extracted from the document.",
+            "Confidence": 95.5
+        },
+        {
+            "BlockType": "LINE", 
+            "Text": "Second line of simulated extracted text.",
+            "Confidence": 92.3
+        },
+        {
+            "BlockType": "LINE",
+            "Text": "Third line demonstrating text extraction simulation.",
+            "Confidence": 94.1
+        }
+    ]
+    
+    return {
+        "JobStatus": "SUCCEEDED",
+        "Blocks": simulated_blocks
+    }
 
-def handler(event, _ctx):
+def validate_blocks(blocks):
+    """Simple validation to check if blocks have non-empty text"""
+    for block in blocks:
+        if block.get("BlockType") == "LINE" and "Text" in block and not block["Text"].strip():
+            return False
+    return True
+
+def handler(event, context):
     run_id = event.get('runId', str(uuid.uuid4()))
+    document_id = event.get('documentId', 'unknown')
+    start_time = time.time()
+    step = "Validate"
     
     # Log the input event
-    logger.info(f"Received event: {json.dumps(event)}")
+    print(f"Received event: {json.dumps(event)}")
     
     try:
         # Log step start
-        exec_logger.log_start(run_id, "validate",
-                             textractJobId=event.get("textractJobId"),
-                             s3Key=event.get("key"))
+        log_to_dynamodb(run_id, document_id, step, "STARTED", "Simulating Textract document analysis")
         
         # Get required parameters from event
-        textract_job_id = event.get("textractJobId")
         bucket = event.get("bucket") 
         key = event.get("key")
         
-        if not textract_job_id:
-            raise ValueError("Missing textractJobId in event")
         if not bucket:
             raise ValueError("Missing bucket in event")
         if not key:
             raise ValueError("Missing key in event")
             
-        logger.info(f"Processing Textract job: {textract_job_id}")
-        logger.info(f"Original document: s3://{bucket}/{key}")
+        print(f"Simulating Textract processing for document: s3://{bucket}/{key}")
         
-        # Wait for Textract job to complete and get results
-        response = wait_for_textract_completion(textract_job_id)
+        # Simulate Textract processing
+        response = simulate_textract_processing(bucket, key)
         
-        # Get blocks from the Textract response
-        if "Blocks" not in response:
-            raise ValueError(f"No Blocks found in Textract response. Available fields: {list(response.keys())}")
-            
-        blocks = response["Blocks"]
-        logger.info(f"Found {len(blocks)} blocks to validate")
+        # Get blocks from the simulated response
+        blocks = response.get("Blocks", [])
+        print(f"Simulated {len(blocks)} text blocks")
         
         # Simple validation - check for empty text blocks
         if not validate_blocks(blocks):
-            logger.error("Validation failed: Found empty text blocks")
             raise ValueError("Validation failed: Found empty text blocks")
         
-        logger.info("Validation successful")
+        processing_time = time.time() - start_time
+        print(f"Validation successful in {processing_time:.2f} seconds")
         
         # Log step success
-        exec_logger.log_success(run_id, "validate",
-                               textractJobId=textract_job_id,
-                               blocksCount=len(blocks),
-                               validationStatus="SUCCESS")
+        log_to_dynamodb(run_id, document_id, step, "SUCCESS", 
+                       f"Simulated Textract processing successful. Found {len(blocks)} text blocks.")
         
-        # Return the original event plus validation status
+        # Generate a simulated textract job ID for downstream compatibility
+        simulated_job_id = f"simulated-job-{uuid.uuid4().hex[:8]}"
+        
+        # Return the original event plus validation status and simulated job ID
         return {
-            "textractJobId": textract_job_id,
+            "textractJobId": simulated_job_id,
             "bucket": bucket,
             "key": key,
             "runId": run_id,
+            "documentId": document_id,
             "validation": {
                 "status": "SUCCESS",
-                "blocks_count": len(blocks)
-            }
+                "blocks_count": len(blocks),
+                "processing_time": round(processing_time, 2),
+                "simulated": True
+            },
+            "blocks": blocks  # Include blocks for downstream processing
         }
         
     except Exception as e:
-        logger.error(f"Validation error: {str(e)}")
-        logger.error(f"Event structure: {json.dumps(event)}")
-        
-        # Send error notification directly
-        send_error_notification(run_id, bucket, key, str(e), "Validate")
+        processing_time = time.time() - start_time
+        error_message = str(e)
+        print(f"Validation error: {error_message}")
+        print(f"Event structure: {json.dumps(event)}")
         
         # Log error
-        exec_logger.log_error(run_id, "validate", str(e),
-                             textractJobId=event.get("textractJobId"),
-                             s3Key=event.get("key"))
+        log_to_dynamodb(run_id, document_id, step, "FAILED", f"Validation failed: {error_message}")
+        
+        # Send error notification
+        send_error_notification(run_id, bucket, key, document_id, error_message, processing_time, step)
         
         raise
