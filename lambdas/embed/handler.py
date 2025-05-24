@@ -76,6 +76,7 @@ def handler(event, context):
     
     chunk_count = len(simulated_chunks)
     total_text_length = sum(len(chunk["text"]) for chunk in simulated_chunks)
+    avg_chunk_size = total_text_length // chunk_count if chunk_count > 0 else 0
     
     log_to_dynamodb(run_id, document_id, step, "SUCCESS", 
                    f"Simulated embeddings for {chunk_count} chunks, total text length: {total_text_length}")
@@ -86,5 +87,8 @@ def handler(event, context):
         "embeddings": simulated_embeddings,
         "chunk_count": chunk_count,
         "text_length": total_text_length,
+        "avg_chunk_size": avg_chunk_size,
+        "vector_dimensions": 384,
+        "embedding_model": "simulated-embeddings-v1",
         "simulated": True
     }

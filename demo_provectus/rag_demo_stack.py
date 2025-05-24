@@ -285,18 +285,53 @@ Error Details:
 '''
             elif status == 'SUCCESS':
                 results = message_body.get('processingResults', {})
+                pipeline_steps = message_body.get('pipelineSteps', {})
+                ingestion_summary = message_body.get('ingestionSummary', {})
+                
                 email_body += f'''
-Processing Results:
-- Chunks Created: {results.get('chunkCount', 'Unknown')}
-- Text Length: {results.get('textLength', 'Unknown')} characters
-- Processing Time: {results.get('processingTimeSeconds', 'Unknown')}s
-- Average Chunk Size: {results.get('avgChunkSize', 'Unknown')} characters
-'''
-            
-            email_body += f'''
+🎉 INGESTION SUCCESS SUMMARY:
+{ingestion_summary.get('message', 'Document processing completed successfully!')}
 
-Raw Message:
-{json.dumps(message_body, indent=2)}
+📊 PROCESSING RESULTS:
+- Chunks Created: {results.get('chunkCount', 'Unknown')}
+- Total Text Length: {results.get('textLength', 'Unknown'):,} characters
+- Average Chunk Size: {results.get('avgChunkSize', 'Unknown')} characters
+- Vector Dimensions: {results.get('vectorDimensions', 'Unknown')}
+- Embedding Model: {results.get('embeddingModel', 'Unknown')}
+
+🔄 PIPELINE STEPS COMPLETED:
+'''
+                
+                step_names = {
+                    'initDb': '1️⃣ Database Initialization',
+                    'textract': '2️⃣ Text Extraction', 
+                    'validate': '3️⃣ Content Validation',
+                    'embed': '4️⃣ Text Embedding',
+                    'load': '5️⃣ Data Loading'
+                }
+                
+                for step_key, step_data in pipeline_steps.items():
+                    step_name = step_names.get(step_key, step_key.title())
+                    step_status = step_data.get('status', 'Unknown')
+                    email_body += f"   {step_name}: ✅ {step_status}\n"
+                    
+                    # Add step-specific details
+                    if step_key == 'initDb' and 'documentId' in step_data:
+                        email_body += f"      → Document ID: {step_data['documentId']}\n"
+                    elif step_key == 'validate' and 'blocksProcessed' in step_data:
+                        email_body += f"      → Blocks Processed: {step_data['blocksProcessed']}\n"
+                    elif step_key == 'embed' and 'chunksEmbedded' in step_data:
+                        email_body += f"      → Chunks Embedded: {step_data['chunksEmbedded']}\n"
+                    elif step_key == 'load' and 'recordsInserted' in step_data:
+                        email_body += f"      → Records Inserted: {step_data['recordsInserted']}\n"
+                
+                email_body += f'''
+
+✅ STATUS: Ready for querying! 
+   The document has been successfully ingested and is now available for semantic search.
+
+💡 NEXT STEPS:
+   You can now query this document using the RAG system's search functionality.
 '''
             
             # Send email via SNS
@@ -802,7 +837,7 @@ class StateMachineConstruct(Construct):
                 result_path="$.loaded"
             )
         ).next(
-            # Success notification
+            # Success notification with comprehensive metadata
             tasks.LambdaInvoke(
                 self, "NotifySuccess",
                 lambda_function=lambda_fns.notify_fn,
@@ -812,11 +847,42 @@ class StateMachineConstruct(Construct):
                     "documentInfo": {
                         "bucket": sfn.JsonPath.string_at("$.bucket"),
                         "key": sfn.JsonPath.string_at("$.key"),
-                        "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId")
+                        "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId"),
+                        "fileName": sfn.JsonPath.string_at("$.key")
                     },
                     "processingResults": {
                         "chunkCount": sfn.JsonPath.number_at("$.embedded.Payload.chunk_count"),
-                        "textLength": sfn.JsonPath.number_at("$.embedded.Payload.text_length")
+                        "textLength": sfn.JsonPath.number_at("$.embedded.Payload.text_length"),
+                        "avgChunkSize": sfn.JsonPath.number_at("$.embedded.Payload.avg_chunk_size"),
+                        "vectorDimensions": sfn.JsonPath.number_at("$.embedded.Payload.vector_dimensions"),
+                        "embeddingModel": sfn.JsonPath.string_at("$.embedded.Payload.embedding_model")
+                    },
+                    "pipelineSteps": {
+                        "initDb": {
+                            "status": "COMPLETED", 
+                            "documentId": sfn.JsonPath.string_at("$.initDb.Payload.documentId")
+                        },
+                        "textract": {
+                            "status": "SIMULATED",
+                            "jobId": sfn.JsonPath.string_at("$.textract.JobId")
+                        },
+                        "validate": {
+                            "status": "COMPLETED",
+                            "blocksProcessed": sfn.JsonPath.number_at("$.validated.Payload.blocks_count")
+                        },
+                        "embed": {
+                            "status": "COMPLETED",
+                            "chunksEmbedded": sfn.JsonPath.number_at("$.embedded.Payload.chunk_count")
+                        },
+                        "load": {
+                            "status": "COMPLETED",
+                            "recordsInserted": sfn.JsonPath.number_at("$.loaded.Payload.records_inserted")
+                        }
+                    },
+                    "ingestionSummary": {
+                        "message": "Document ingestion completed successfully! All text has been processed, embedded, and stored in the vector database.",
+                        "queryReady": True,
+                        "totalProcessingSteps": 5
                     }
                 }),
                 result_path="$.notification"

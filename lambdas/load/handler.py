@@ -319,7 +319,8 @@ def handler(event, context):
             **event,
             'status': 'success',
             'message': f'Successfully loaded {items_stored} chunks',
-            'rowCount': items_stored
+            'rowCount': items_stored,
+            'records_inserted': items_stored
         }
         
     except Exception as e:
