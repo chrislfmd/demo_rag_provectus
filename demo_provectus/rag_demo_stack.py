@@ -206,6 +206,7 @@ class NotificationConstruct(Construct):
                             actions=["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
                             resources=[
                                 self.notification_queue.queue_arn,
+                                self.success_queue.queue_arn,
                                 self.error_queue.queue_arn
                             ]
                         )
@@ -229,7 +230,7 @@ class NotificationConstruct(Construct):
         self.email_forwarder_fn = _lambda.Function(
             self, "EmailForwarderFn",
             runtime=_lambda.Runtime.PYTHON_3_11,
-            handler="handler.handler",
+            handler="index.handler",
             code=_lambda.Code.from_inline("""
 import json
 import boto3
@@ -285,7 +286,7 @@ Error Details:
 '''
             elif status == 'SUCCESS':
                 processing_results = message_body.get('processingResults', {})
-                success_metrics = message_body.get('successMetrics', {})
+                completion_info = message_body.get('completionInfo', {})
                 
                 email_body += f'''
 🎉 INGESTION SUCCESS SUMMARY:
@@ -293,12 +294,15 @@ Document processing completed successfully! All text has been processed, embedde
 
 📊 PROCESSING RESULTS:
 - Pipeline: {message_body.get('pipeline', 'RAG Document Processing')}
-- Chunks Created: {success_metrics.get('chunksCreated', processing_results.get('chunkCount', 'Unknown'))}
-- Processing Time: {success_metrics.get('processingTimeSeconds', processing_results.get('processingTime', 'Unknown'))} seconds
-- Document Size: {success_metrics.get('documentSize', processing_results.get('textLength', 'Unknown'))} characters
+- Chunks Created: {processing_results.get('chunkCount', 'Unknown')}
+- Processing Time: {processing_results.get('processingTimeSeconds', 'Unknown')} seconds
+- Document Size: {processing_results.get('textLength', 'Unknown')} characters
+- Average Chunk Size: {processing_results.get('avgChunkSize', 'Unknown')} characters
 
 ✅ STATUS: Ready for querying! 
    The document has been successfully ingested and is now available for semantic search.
+   Data Stored: {completion_info.get('dataStored', 'Unknown')}
+   Search Ready: {completion_info.get('searchReady', 'Unknown')}
 
 💡 NEXT STEPS:
    You can now query this document using the RAG system's search functionality.
