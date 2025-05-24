@@ -69,7 +69,7 @@ def handler(event, context):
         # Write to DynamoDB
         table.put_item(Item=log_entry)
         
-        print(f"✅ Logged execution: {run_id} - {step} - {status}")
+        print(f"Logged execution: {run_id} - {step} - {status}")
         
         return {
             'statusCode': 200,
@@ -82,10 +82,13 @@ def handler(event, context):
         }
         
     except Exception as e:
-        print(f"❌ Error logging execution: {str(e)}")
+        error_msg = str(e)
+        print(f"Error logging execution: {error_msg}")
+        
         return {
             'statusCode': 500,
             'body': json.dumps({
-                'error': str(e)
+                'error': error_msg,
+                'runId': run_id
             })
         }

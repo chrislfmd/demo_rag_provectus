@@ -34,10 +34,10 @@ def log_to_dynamodb(run_id, document_id, step, status, message=None):
         response = table.put_item(Item=log_item)
         
         print(f"DynamoDB put_item response: {response}")
-        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        print(f"Successfully logged to DynamoDB: {log_item}")
         
     except Exception as e:
-        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
         print(f"   Table name: {table_name}")
         print(f"   Log item: {log_item}")
         # Don't re-raise the exception to avoid breaking the Lambda
@@ -134,9 +134,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 MessageAttributes=message_attributes
             )
             messages_sent += 1
-            print(f"✅ Sent notification to main queue: {status}")
+            print(f"Sent notification to main queue: {status}")
         except Exception as e:
-            print(f"❌ Failed to send to main queue: {str(e)}")
+            print(f"Failed to send to main queue: {str(e)}")
         
         # Send to status-specific queues
         if status == "SUCCESS" and success_queue_url:
@@ -157,9 +157,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     MessageAttributes=message_attributes
                 )
                 messages_sent += 1
-                print(f"✅ Sent success notification to success queue")
+                print(f"Sent success notification to success queue")
             except Exception as e:
-                print(f"⚠️ Failed to send to success queue: {str(e)}")
+                print(f"Failed to send to success queue: {str(e)}")
         
         elif status == "FAILED" and error_queue_url:
             try:
@@ -179,9 +179,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     MessageAttributes=message_attributes
                 )
                 messages_sent += 1
-                print(f"✅ Sent error notification to error queue")
+                print(f"Sent error notification to error queue")
             except Exception as e:
-                print(f"⚠️ Failed to send to error queue: {str(e)}")
+                print(f"Failed to send to error queue: {str(e)}")
         
         # Log success
         log_to_dynamodb(run_id, document_id, step, "SUCCESS", 
@@ -199,7 +199,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
     except Exception as e:
         error_message = str(e)
-        print(f"❌ Error sending notifications: {error_message}")
+        print(f"Error sending notifications: {error_message}")
         
         # Log error
         log_to_dynamodb(run_id, document_id, step, "FAILED", f"Notification failed: {error_message}")

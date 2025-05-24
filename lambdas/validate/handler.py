@@ -34,10 +34,10 @@ def log_to_dynamodb(run_id, document_id, step, status, message=None):
         response = table.put_item(Item=log_item)
         
         print(f"DynamoDB put_item response: {response}")
-        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        print(f"Successfully logged to DynamoDB: {log_item}")
         
     except Exception as e:
-        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
         print(f"   Table name: {table_name}")
         print(f"   Log item: {log_item}")
         # Don't re-raise the exception to avoid breaking the Lambda
@@ -87,9 +87,9 @@ def send_error_notification(run_id, bucket, key, document_id, error_message, pro
                     'FailedStep': {'StringValue': step, 'DataType': 'String'}
                 }
             )
-            print(f"✅ Sent error notification to main queue")
+            print(f"Sent error notification to main queue")
         except Exception as e:
-            print(f"⚠️ Failed to send to main queue: {str(e)}")
+            print(f"Failed to send to main queue: {str(e)}")
         
         # Send to error-specific queue
         if error_queue_url:
@@ -102,12 +102,12 @@ def send_error_notification(run_id, bucket, key, document_id, error_message, pro
                         'FailedStep': {'StringValue': step, 'DataType': 'String'}
                     }
                 )
-                print(f"✅ Sent error notification to error queue")
+                
+                print(f"Sent error notification to error queue")
             except Exception as e:
-                print(f"⚠️ Failed to send to error queue: {str(e)}")
-        
+                print(f"Failed to send to error queue: {str(e)}")
     except Exception as e:
-        print(f"❌ Failed to send error notification: {str(e)}")
+        print(f"Failed to send error notification: {str(e)}")
 
 def simulate_textract_processing(bucket, key):
     """Simulate Textract document analysis"""

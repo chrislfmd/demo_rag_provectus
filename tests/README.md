@@ -2,7 +2,7 @@
 
 This directory contains all test scripts and debugging utilities for the RAG (Retrieval-Augmented Generation) pipeline system.
 
-## 🧪 Main Test Scripts
+## Main Test Scripts
 
 ### `test_complete_pipeline.py`
 **Complete End-to-End Pipeline Test**
@@ -26,7 +26,7 @@ This directory contains all test scripts and debugging utilities for the RAG (Re
 - Compares Lambda output with expected email content
 - **Usage**: `python test_lambda_message_format.py`
 
-## 🔍 Monitoring & Debug Scripts
+## Monitoring & Debug Scripts
 
 ### `check_recent_executions.py`
 **Pipeline Execution Monitoring**
@@ -56,7 +56,7 @@ This directory contains all test scripts and debugging utilities for the RAG (Re
 - Multi-function log correlation
 - **Usage**: `python check_lambda_logs.py`
 
-## 🔧 Specific Debug Utilities
+## Specific Debug Utilities
 
 ### `debug_email_delivery.py`
 **Email Delivery Debugging**
@@ -78,7 +78,7 @@ This directory contains all test scripts and debugging utilities for the RAG (Re
 - Explains SQS batching and SNS delivery delays
 - **Usage**: `python email_timing_analysis.py`
 
-## 📊 Status Check Scripts
+## Status Check Scripts
 
 ### `check_current_execution.py`
 **Single Execution Status**
@@ -109,7 +109,7 @@ This directory contains all test scripts and debugging utilities for the RAG (Re
 - Shows execution status, queue status, and email delivery
 - **Usage**: `python test_summary.py`
 
-## 🚀 Quick Testing Guide
+## Quick Testing Guide
 
 **For a complete pipeline test:**
 ```bash
@@ -134,14 +134,14 @@ python check_lambda_logs.py
 python check_dlq_messages.py
 ```
 
-## 📧 Expected Email Notifications
+## Expected Email Notifications
 
 When pipeline completes successfully, you should receive:
-- **Subject**: "📡 RAG Pipeline Notification - SUCCESS"
+- **Subject**: "RAG Pipeline Notification - SUCCESS"
 - **Content**: Processing metadata, chunk count, timing, next steps
 - **Delivery Time**: 1-6 minutes after pipeline completion
 
-## 🏗️ Pipeline Architecture
+## Pipeline Architecture
 
 The tests validate this complete flow:
 1. **S3 Upload** → Automatic trigger

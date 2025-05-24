@@ -87,19 +87,19 @@ def upload_and_monitor():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"medical_case_study_{timestamp}.pdf"
     
-    print("🧪 COMPLETE PIPELINE TEST")
+    print("COMPLETE PIPELINE TEST")
     print("=" * 60)
-    print(f"📄 Creating test PDF: {filename}")
+    print(f"Creating test PDF: {filename}")
     
     # Create PDF content
     pdf_content = create_test_pdf()
-    print(f"✅ PDF created ({len(pdf_content)} bytes)")
+    print(f"PDF created ({len(pdf_content)} bytes)")
     
     # Upload to S3
     s3 = boto3.client('s3')
     bucket_name = 'rag-demo-raw-pdf-v2'
     
-    print(f"\n📤 Uploading to S3: s3://{bucket_name}/{filename}")
+    print(f"\nUploading to S3: s3://{bucket_name}/{filename}")
     
     try:
         s3.put_object(
@@ -108,19 +108,19 @@ def upload_and_monitor():
             Body=pdf_content,
             ContentType='application/pdf'
         )
-        print(f"✅ PDF uploaded successfully!")
-        print(f"🔄 S3 event notification should trigger pipeline automatically...")
+        print(f"PDF uploaded successfully!")
+        print(f"S3 event notification should trigger pipeline automatically...")
         
     except Exception as e:
-        print(f"❌ Upload failed: {str(e)}")
+        print(f"Upload failed: {str(e)}")
         return
     
     # Monitor for Step Functions execution
-    print(f"\n🔍 MONITORING PIPELINE EXECUTION:")
+    print(f"\nMONITORING PIPELINE EXECUTION:")
     stepfunctions = boto3.client('stepfunctions')
     
     # Wait a moment for S3 event to trigger
-    print("   ⏱️  Waiting 10 seconds for S3 event to trigger...")
+    print("   Waiting 10 seconds for S3 event to trigger...")
     time.sleep(10)
     
     # Look for recent executions
@@ -139,11 +139,11 @@ def upload_and_monitor():
             execution_arn = execution['executionArn']
             execution_name = execution['name']
             
-            print(f"   ✅ Found running execution: {execution_name}")
-            print(f"   📋 Execution ARN: {execution_arn}")
+            print(f"   Found running execution: {execution_name}")
+            print(f"   Execution ARN: {execution_arn}")
             
             # Monitor execution progress
-            print(f"\n⏳ MONITORING EXECUTION PROGRESS:")
+            print(f"\nMONITORING EXECUTION PROGRESS:")
             start_time = datetime.now()
             max_wait_time = 120  # 2 minutes
             
@@ -158,7 +158,7 @@ def upload_and_monitor():
                     break
                     
                 if elapsed > max_wait_time:
-                    print(f"   ⚠️  Timeout after {max_wait_time} seconds")
+                    print(f"   Timeout after {max_wait_time} seconds")
                     break
                     
                 time.sleep(5)
@@ -169,40 +169,40 @@ def upload_and_monitor():
             
             if final_status == 'SUCCEEDED':
                 duration = final_response['stopDate'] - final_response['startDate']
-                print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
-                print(f"   ⏱️  Total Duration: {duration}")
-                print(f"   📧 Email notification should arrive within 1-6 minutes")
+                print(f"\nPIPELINE COMPLETED SUCCESSFULLY!")
+                print(f"   Total Duration: {duration}")
+                print(f"   Email notification should arrive within 1-6 minutes")
                 
                 # Extract run ID if possible
                 try:
                     input_data = json.loads(final_response['input'])
                     run_id = input_data.get('runId', 'Unknown')
-                    print(f"   🔍 Run ID: {run_id}")
+                    print(f"   Run ID: {run_id}")
                 except:
-                    print(f"   🔍 Run ID: Check execution input")
+                    print(f"   Run ID: Check execution input")
                     
             elif final_status == 'FAILED':
-                print(f"\n❌ PIPELINE FAILED!")
+                print(f"\nPIPELINE FAILED!")
                 print(f"   Error: {final_response.get('error', 'Unknown')}")
                 print(f"   Cause: {final_response.get('cause', 'Unknown')}")
             else:
-                print(f"\n📊 PIPELINE STATUS: {final_status}")
+                print(f"\nPIPELINE STATUS: {final_status}")
                 
         else:
-            print(f"   ⚠️  No running executions found")
-            print(f"   🔍 Check if S3 event notification is configured correctly")
+            print(f"   No running executions found")
+            print(f"   Check if S3 event notification is configured correctly")
             
     except Exception as e:
-        print(f"   ❌ Error monitoring execution: {str(e)}")
+        print(f"   Error monitoring execution: {str(e)}")
     
-    print(f"\n📋 TEST SUMMARY:")
-    print(f"   📄 Test file: {filename}")
-    print(f"   📤 Uploaded to: s3://{bucket_name}/{filename}")
-    print(f"   🕐 Test time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   📧 Expected email: 'RAG Pipeline Notification - SUCCESS'")
-    print(f"\n💡 NEXT STEPS:")
+    print(f"\nTEST SUMMARY:")
+    print(f"   Test file: {filename}")
+    print(f"   Uploaded to: s3://{bucket_name}/{filename}")
+    print(f"   Test time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Expected email: 'RAG Pipeline Notification - SUCCESS'")
+    print(f"\nNEXT STEPS:")
     print(f"   1. Wait for email notification (1-6 minutes)")
-    print(f"   2. Check email subject: '📡 RAG Pipeline Notification - SUCCESS'")
+    print(f"   2. Check email subject: 'RAG Pipeline Notification - SUCCESS'")
     print(f"   3. Verify processing details in email body")
 
 if __name__ == "__main__":

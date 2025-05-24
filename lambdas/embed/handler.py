@@ -33,10 +33,10 @@ def log_to_dynamodb(run_id, document_id, step, status, message=None):
         response = table.put_item(Item=log_item)
         
         print(f"DynamoDB put_item response: {response}")
-        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        print(f"Successfully logged to DynamoDB: {log_item}")
         
     except Exception as e:
-        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
         print(f"   Table name: {table_name}")
         print(f"   Log item: {log_item}")
         # Don't re-raise the exception to avoid breaking the Lambda

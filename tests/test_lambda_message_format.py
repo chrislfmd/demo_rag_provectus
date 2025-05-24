@@ -1,116 +1,113 @@
-import boto3
-import json
+print("TESTING LAMBDA MESSAGE FORMAT")
+print("=" * 50)
 
-print("🧪 TESTING LAMBDA MESSAGE FORMAT")
-print("=" * 60)
-
-# Recreate the exact message format that our Lambda sends
-# Based on our successful pipeline run
-test_message_body = {
-    "timestamp": "2025-05-24T12:12:27.000000Z",
-    "runId": "7a79cc4b-a626-42d5-a099-a34039c01906",
+# Create a realistic message that matches what the Lambda sends
+lambda_message = {
+    "timestamp": "2025-05-24T08:30:45.123Z",
+    "runId": "test-message-format-001",
     "status": "SUCCESS",
     "pipeline": "RAG Document Processing",
     "documentInfo": {
         "bucket": "rag-demo-raw-pdf-v2",
-        "key": "test_success_notification_20250524_081217.txt",
-        "fileName": "test_success_notification_20250524_081217.txt"
+        "key": "medical_case_study_20250524_083045.pdf",
+        "documentId": "doc-test-001"
     },
     "processingResults": {
-        "chunkCount": 3,
-        "textLength": 143,
-        "processingTimeSeconds": 2.5,
-        "avgChunkSize": 47
+        "chunkCount": 8,
+        "processingTimeSeconds": 42.5,
+        "textLength": 2340,
+        "avgChunkSize": 292
     },
     "completionInfo": {
-        "dataStored": True,
-        "searchReady": True
+        "dataStored": "8 chunks",
+        "searchReady": "Available"
     }
 }
 
-# Recreate the exact email body format from our Lambda
-status = test_message_body.get('status', 'UNKNOWN')
-processing_results = test_message_body.get('processingResults', {})
-completion_info = test_message_body.get('completionInfo', {})
+# Create email body that matches the CDK template exactly
+status = lambda_message["status"]
+processing_results = lambda_message.get('processingResults', {})
+completion_info = lambda_message.get('completionInfo', {})
 
 email_body = f'''
 RAG Pipeline Notification
 
 Status: {status}
-Timestamp: {test_message_body.get('timestamp', 'Unknown')}
-Run ID: {test_message_body.get('runId', 'Unknown')}
+Timestamp: {lambda_message.get('timestamp', 'Unknown')}
+Run ID: {lambda_message.get('runId', 'Unknown')}
 
 Document Information:
-- Bucket: {test_message_body.get('documentInfo', {}).get('bucket', 'Unknown')}
-- Key: {test_message_body.get('documentInfo', {}).get('key', 'Unknown')}
+- Bucket: {lambda_message.get('documentInfo', {}).get('bucket', 'Unknown')}
+- Key: {lambda_message.get('documentInfo', {}).get('key', 'Unknown')}
 
-'''
-
-email_body += f'''
-🎉 INGESTION SUCCESS SUMMARY:
+INGESTION SUCCESS SUMMARY:
 Document processing completed successfully! All text has been processed, embedded, and stored in the vector database.
 
-📊 PROCESSING RESULTS:
-- Pipeline: {test_message_body.get('pipeline', 'RAG Document Processing')}
+PROCESSING RESULTS:
+- Pipeline: {lambda_message.get('pipeline', 'RAG Document Processing')}
 - Chunks Created: {processing_results.get('chunkCount', 'Unknown')}
 - Processing Time: {processing_results.get('processingTimeSeconds', 'Unknown')} seconds
 - Document Size: {processing_results.get('textLength', 'Unknown')} characters
 - Average Chunk Size: {processing_results.get('avgChunkSize', 'Unknown')} characters
 
-✅ STATUS: Ready for querying! 
+STATUS: Ready for querying!
    The document has been successfully ingested and is now available for semantic search.
    Data Stored: {completion_info.get('dataStored', 'Unknown')}
    Search Ready: {completion_info.get('searchReady', 'Unknown')}
 
-💡 NEXT STEPS:
+NEXT STEPS:
    You can now query this document using the RAG system's search functionality.
 '''
 
-subject = f"📡 RAG Pipeline Notification - {status}"
+subject = f"RAG Pipeline Notification - {status}"
 
-print("📋 MESSAGE DETAILS:")
-print(f"Subject: {subject}")
-print(f"Message length: {len(email_body)} characters")
+print("MESSAGE DETAILS:")
+print(f"   Subject: {subject}")
+print(f"   Status: {status}")
+print(f"   Processing Time: {processing_results.get('processingTimeSeconds')}s")
 
-print(f"\n📧 EMAIL BODY PREVIEW:")
-print("=" * 40)
-print(email_body[:500] + "..." if len(email_body) > 500 else email_body)
-print("=" * 40)
+print(f"\nEMAIL BODY PREVIEW:")
+print(email_body)
 
-# Test sending this exact format
-sns = boto3.client('sns')
-notification_topic_arn = "arn:aws:sns:us-east-1:702645448228:rag-pipeline-notifications"
-
+# Test sending with SNS
 try:
-    print(f"\n🧪 SENDING TEST WITH LAMBDA FORMAT:")
+    import boto3
+    
+    print(f"\nTESTING WITH LAMBDA FORMAT:")
+    
+    sns = boto3.client('sns')
+    topic_arn = "arn:aws:sns:us-east-1:702645448228:rag-pipeline-notifications"
+    
     response = sns.publish(
-        TopicArn=notification_topic_arn,
+        TopicArn=topic_arn,
         Subject=subject,
         Message=email_body
     )
-    print(f"   ✅ Lambda format test email sent!")
-    print(f"   📧 SNS Message ID: {response['MessageId']}")
-    print(f"   ⏰ Check your email in 1-5 minutes")
+    
+    print(f"   Lambda format test email sent!")
+    print(f"   SNS Message ID: {response['MessageId']}")
+    print(f"   Topic: {topic_arn}")
     
 except Exception as e:
-    print(f"   ❌ Failed to send lambda format test: {str(e)}")
-    print(f"   🔍 Error details: {type(e).__name__}")
-    
-    # Try with simpler format
-    print(f"\n🔧 TRYING SIMPLIFIED FORMAT:")
-    simple_message = f"RAG Pipeline Test - Status: {status}\nRun ID: {test_message_body.get('runId')}\nDocument: {test_message_body.get('documentInfo', {}).get('key')}"
-    
-    try:
-        simple_response = sns.publish(
-            TopicArn=notification_topic_arn,
-            Subject=f"Simple Test - {status}",
-            Message=simple_message
-        )
-        print(f"   ✅ Simple format sent: {simple_response['MessageId']}")
-    except Exception as simple_error:
-        print(f"   ❌ Even simple format failed: {str(simple_error)}")
+    print(f"   Failed to send lambda format test: {str(e)}")
+    print(f"   Error details: {type(e).__name__}")
 
-print(f"\n🔍 DIAGNOSIS:")
-print(f"   If you receive the Lambda format test email, then the issue was timing/delivery")
-print(f"   If you don't receive it, there's a formatting issue with the Lambda message")
-print(f"   The emojis or special characters might be causing problems") 
+# Try a very simple format as backup
+print(f"\nTRYING SIMPLIFIED FORMAT:")
+try:
+    simple_response = sns.publish(
+        TopicArn=topic_arn,
+        Subject="RAG Pipeline Test - Simple Format",
+        Message="This is a simplified test message to verify email delivery is working."
+    )
+    
+    print(f"   Simple format sent: {simple_response['MessageId']}")
+except Exception as simple_error:
+    print(f"   Even simple format failed: {str(simple_error)}")
+
+print(f"\nDIAGNOSIS:")
+print("The message format above should match exactly what Lambda sends.")
+print("If you don't receive this email, the issue is likely:")
+print("1. SNS topic configuration")
+print("2. Email subscription not confirmed")
+print("3. Email filtering/spam detection") 

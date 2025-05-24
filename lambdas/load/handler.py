@@ -69,10 +69,10 @@ def log_to_dynamodb(run_id, document_id, step, status, message=None):
         response = table.put_item(Item=log_item)
         
         print(f"DynamoDB put_item response: {response}")
-        print(f"✅ Successfully logged to DynamoDB: {log_item}")
+        print(f"Successfully logged to DynamoDB: {log_item}")
         
     except Exception as e:
-        print(f"❌ Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
+        print(f"Failed to log to DynamoDB: {type(e).__name__}: {str(e)}")
         print(f"   Table name: {table_name}")
         print(f"   Log item: {log_item}")
         # Don't re-raise the exception to avoid breaking the Lambda
@@ -127,9 +127,9 @@ def send_success_notification(run_id, bucket, key, document_id, chunks_stored, p
                     'ChunkCount': {'StringValue': str(chunks_stored), 'DataType': 'Number'}
                 }
             )
-            print(f"✅ Sent success notification to main queue")
+            print(f"Sent success notification to main queue")
         except Exception as e:
-            print(f"⚠️ Failed to send to main queue: {str(e)}")
+            print(f"Failed to send to main queue: {str(e)}")
         
         # Send to success-specific queue
         if success_queue_url:
@@ -143,12 +143,12 @@ def send_success_notification(run_id, bucket, key, document_id, chunks_stored, p
                         'ChunkCount': {'StringValue': str(chunks_stored), 'DataType': 'Number'}
                     }
                 )
-                print(f"✅ Sent success notification to success queue")
+                print(f"Sent success notification to success queue")
             except Exception as e:
-                print(f"⚠️ Failed to send to success queue: {str(e)}")
+                print(f"Failed to send to success queue: {str(e)}")
         
     except Exception as e:
-        print(f"❌ Failed to send success notification: {str(e)}")
+        print(f"Failed to send success notification: {str(e)}")
 
 def send_error_notification(run_id, bucket, key, document_id, error_message, processing_time, step="Load"):
     """Send error notification when load operation fails"""
@@ -193,9 +193,9 @@ def send_error_notification(run_id, bucket, key, document_id, error_message, pro
                     'FailedStep': {'StringValue': step, 'DataType': 'String'}
                 }
             )
-            print(f"✅ Sent error notification to main queue")
+            print(f"Sent error notification to main queue")
         except Exception as e:
-            print(f"⚠️ Failed to send to main queue: {str(e)}")
+            print(f"Failed to send to main queue: {str(e)}")
         
         # Send to error-specific queue
         if error_queue_url:
@@ -208,12 +208,12 @@ def send_error_notification(run_id, bucket, key, document_id, error_message, pro
                         'FailedStep': {'StringValue': step, 'DataType': 'String'}
                     }
                 )
-                print(f"✅ Sent error notification to error queue")
+                print(f"Sent error notification to error queue")
             except Exception as e:
-                print(f"⚠️ Failed to send to error queue: {str(e)}")
+                print(f"Failed to send to error queue: {str(e)}")
         
     except Exception as e:
-        print(f"❌ Failed to send error notification: {str(e)}")
+        print(f"Failed to send error notification: {str(e)}")
 
 def handler(event, context):
     run_id = event.get('runId', str(uuid.uuid4()))
@@ -308,7 +308,7 @@ def handler(event, context):
         # Calculate processing time
         processing_time = time.time() - start_time
         
-        # Send success notification - PIPELINE COMPLETED! 🎉
+        # Send success notification - PIPELINE COMPLETED!
         send_success_notification(run_id, bucket, key, document_id, items_stored, processing_time, total_text_length)
         
         # Log step success

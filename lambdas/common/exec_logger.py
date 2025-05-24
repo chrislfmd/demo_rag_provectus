@@ -20,7 +20,7 @@ class ExecutionLogger:
             self.table = self.dynamodb.Table(self.exec_log_table)
         else:
             self.table = None
-            print("⚠️ EXEC_LOG_TABLE not configured - logging disabled")
+            print("EXEC_LOG_TABLE not configured - logging disabled")
     
     def log_step(self, run_id, step, status, **kwargs):
         """
@@ -34,7 +34,7 @@ class ExecutionLogger:
         """
         
         if not self.table:
-            print(f"⚠️ Logging disabled for: {run_id} - {step} - {status}")
+            print(f"Logging disabled for: {run_id} - {step} - {status}")
             return
             
         try:
@@ -64,10 +64,10 @@ class ExecutionLogger:
             # Write to DynamoDB
             self.table.put_item(Item=log_entry)
             
-            print(f"✅ Logged: {run_id} - {step} - {status}")
+            print(f"Logged: {run_id} - {step} - {status}")
             
         except Exception as e:
-            print(f"❌ Error logging {run_id} - {step}: {str(e)}")
+            print(f"Error logging {run_id} - {step}: {str(e)}")
     
     def log_start(self, run_id, step, **kwargs):
         """Log step start"""

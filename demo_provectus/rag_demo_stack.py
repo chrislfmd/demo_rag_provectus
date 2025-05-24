@@ -256,10 +256,10 @@ def handler(event, context):
             
             if status == 'FAILED':
                 topic_arn = os.environ['ERROR_TOPIC_ARN'] 
-                subject = f"🚨 RAG Pipeline Error - {failed_step} Failed"
+                subject = f"RAG Pipeline Error - {failed_step} Failed"
             else:
                 topic_arn = os.environ['NOTIFICATION_TOPIC_ARN']
-                subject = f"📡 RAG Pipeline Notification - {status}"
+                subject = f"RAG Pipeline Notification - {status}"
             
             # Create email-friendly message
             email_body = f'''
@@ -289,22 +289,22 @@ Error Details:
                 completion_info = message_body.get('completionInfo', {})
                 
                 email_body += f'''
-🎉 INGESTION SUCCESS SUMMARY:
+INGESTION SUCCESS SUMMARY:
 Document processing completed successfully! All text has been processed, embedded, and stored in the vector database.
 
-📊 PROCESSING RESULTS:
+PROCESSING RESULTS:
 - Pipeline: {message_body.get('pipeline', 'RAG Document Processing')}
 - Chunks Created: {processing_results.get('chunkCount', 'Unknown')}
 - Processing Time: {processing_results.get('processingTimeSeconds', 'Unknown')} seconds
 - Document Size: {processing_results.get('textLength', 'Unknown')} characters
 - Average Chunk Size: {processing_results.get('avgChunkSize', 'Unknown')} characters
 
-✅ STATUS: Ready for querying! 
+STATUS: Ready for querying! 
    The document has been successfully ingested and is now available for semantic search.
    Data Stored: {completion_info.get('dataStored', 'Unknown')}
    Search Ready: {completion_info.get('searchReady', 'Unknown')}
 
-💡 NEXT STEPS:
+NEXT STEPS:
    You can now query this document using the RAG system's search functionality.
 '''
             
