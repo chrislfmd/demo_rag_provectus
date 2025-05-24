@@ -1,1 +1,0 @@
-{"bucket": "rag-demo-raw-pdf-v2", "key": "incoming/test_1_pdf.pdf", "statusCode": 500, "error": "An error occurred (HttpEndpointNotEnabledException) when calling the ExecuteStatement operation: HttpEndpoint is not enabled for resource arn:aws:rds:us-east-1:702645448228:cluster:ragdemostack-storagevectorcluster13463e06-vd8jssw6tegr."}
