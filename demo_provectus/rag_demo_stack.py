@@ -369,6 +369,15 @@ Error Details:
             )
         )
         
+        # Trigger for success queue
+        self.email_forwarder_fn.add_event_source(
+            event_sources.SqsEventSource(
+                self.success_queue,
+                batch_size=5,
+                max_batching_window=Duration.seconds(10)
+            )
+        )
+        
         # Trigger for error queue (immediate processing)
         self.email_forwarder_fn.add_event_source(
             event_sources.SqsEventSource(
@@ -910,7 +919,7 @@ class StateMachineConstruct(Construct):
             })
         )
 
-        # Use Parallel construct for robust error handling
+        # Create workflow definition with proper error handling
         workflow_definition = sfn.Parallel(
             self, "MainWorkflowWithErrorHandling",
             comment="RAG Pipeline with comprehensive error notifications"
